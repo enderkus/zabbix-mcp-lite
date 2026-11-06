@@ -1,0 +1,144 @@
+# Zabbix 8.0 + official Zabbix MCP server + zabbix-helper MCP + LibreChat, for a local LLM
+#
+#   Zabbix web     : http://localhost:8080        (Admin / zabbix - change it!)
+#   LibreChat      : http://localhost:3080
+#   Zabbix MCP     : http://127.0.0.1:8443/mcp    (for local testing)
+#   zabbix-helper  : http://127.0.0.1:8001/mcp    (for local testing)
+#
+# The LLM runs on the host in LM Studio; containers reach it at host.docker.internal:1234.
+
+name: zabbix-ai
+
+networks:
+  zabbix-ai:
+    ipam:
+      config:
+        - subnet: 172.30.30.0/24   # ZBX_ALLOWEDIP of the MCP server matches this subnet
+
+volumes:
+  zbx-pgdata:
+  lc-mongodata:
+  lc-data:
+  lc-uploads:
+  lc-images:
+  lc-logs:
+
+services:
+  # ---------------------------------------------------------------- Zabbix
+  zabbix-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZBX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+    volumes:
+      - zbx-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U zabbix -d zabbix"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [zabbix-ai]
+
+  zabbix-server:
+    image: zabbix/zabbix-server-pgsql:alpine-8.0-latest
+    restart: unless-stopped
+    depends_on:
+      zabbix-db:
+        condition: service_healthy
+    environment:
+      DB_SERVER_HOST: zabbix-db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZBX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+      TZ: ${TZ:-UTC}
+    networks: [zabbix-ai]
+
+  zabbix-web:
+    image: zabbix/zabbix-web-nginx-pgsql:alpine-8.0-latest
+    restart: unless-stopped
+    depends_on: [zabbix-server]
+    environment:
+      ZBX_SERVER_HOST: zabbix-server
+      DB_SERVER_HOST: zabbix-db
+      POSTGRES_USER: zabbix
+      POSTGRES_PASSWORD: ${ZBX_DB_PASSWORD}
+      POSTGRES_DB: zabbix
+      PHP_TZ: ${TZ:-UTC}
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8080:8080"
+    networks: [zabbix-ai]
+
+  # Agent that monitors the default "Zabbix server" host
+  zabbix-agent:
+    image: zabbix/zabbix-agent2:alpine-8.0-latest
+    restart: unless-stopped
+    hostname: zabbix-agent
+    depends_on: [zabbix-server]
+    environment:
+      ZBX_HOSTNAME: "Zabbix server"
+      ZBX_SERVER_HOST: zabbix-server
+      ZBX_SERVER_ACTIVE: zabbix-server
+    networks: [zabbix-ai]
+
+  # ---------------------------------------------------------------- Official Zabbix MCP
+  zabbix-mcp:
+    image: zabbix/zabbix-mcp-server:alpine-8.0-latest
+    restart: unless-stopped
+    depends_on: [zabbix-web]
+    environment:
+      ZBX_FRONTEND_URL: http://zabbix-web:8080/api_jsonrpc.php
+      ZBX_ALLOWEDIP: 172.30.30.0/24
+      # Maximum size of a tool response (16K-256K, default 64K).
+      # At 16K a single host record (83 triggers) does not fit and host_get returns nothing.
+      # 32K fits one host without overflowing a small local model's context.
+      ZBX_MAX_RESPONSE_SIZE: 32K
+      # Read-only: only *_get tools are exposed; problem_* and maintenance_* are denied.
+      ZBX_ALLOWTOOL_REGEXP_0: '_get$$'
+      ZBX_DENYTOOL_1: '*'
+    ports:
+      - "127.0.0.1:8443:8443"
+    networks: [zabbix-ai]
+
+  # ---------------------------------------------------------------- zabbix-helper MCP
+  # host_list (compact host list) + history_recent (last N minutes, summarized).
+  # Lets a small model skip Unix timestamps / averages and avoids huge tool responses.
+  # Stores no token: forwards the client's Authorization header to the Zabbix API.
+  zabbix-helper:
+    build: ./zabbix-helper
+    image: zabbix-ai/zabbix-helper:local
+    restart: unless-stopped
+    depends_on: [zabbix-web]
+    environment:
+      ZABBIX_API_URL: http://zabbix-web:8080/api_jsonrpc.php
+      TZ: ${TZ:-UTC}
+    ports:
+      - "127.0.0.1:8001:8000"
+    networks: [zabbix-ai]
+
+  # ---------------------------------------------------------------- LibreChat
+  librechat-mongodb:
+    image: mongo:8.0.20
+    restart: unless-stopped
+    command: mongod --noauth   # reachable only inside the Docker network
+    volumes:
+      - lc-mongodata:/data/db
+    networks: [zabbix-ai]
+
+  librechat:
+    image: registry.librechat.ai/librechat-ai/librechat-dev:latest
+    restart: unless-stopped
+    depends_on: [librechat-mongodb, zabbix-mcp, zabbix-helper]
+    env_file: librechat.env
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:3080:3080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./librechat.yaml:/app/librechat.yaml:ro
+      - lc-data:/app/data
+      - lc-uploads:/app/uploads
+      - lc-images:/app/client/public/images
+      - lc-logs:/app/logs
+    networks: [zabbix-ai]

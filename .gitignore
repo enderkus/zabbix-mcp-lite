@@ -1,0 +1,13 @@
+# Secrets
+.env
+librechat.env
+
+# Benchmark scratch files
+bench/results/*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
