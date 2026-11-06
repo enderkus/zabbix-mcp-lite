@@ -20,11 +20,21 @@ endpoints:
 # from LibreChat's SSRF protection explicitly.
 mcpSettings:
   allowedAddresses:
+    - 'zabbix-mcp-lite:8000'
     - 'zabbix-mcp:8443'
-    - 'zabbix-helper:8000'
 
 mcpServers:
-  # Official Zabbix MCP server
+  # zabbix-mcp-lite: host_list, problem_list, latest_data, metric_history.
+  # Built for small local models; give the agent only these tools.
+  zabbix-lite:
+    type: streamable-http
+    url: http://zabbix-mcp-lite:8000/mcp
+    headers:
+      Authorization: 'Bearer ${ZABBIX_MCP_TOKEN}'
+    requiresOAuth: false
+    timeout: 60000
+
+  # Official Zabbix MCP server (read-only *_get tools). Optional: kept for comparison.
   zabbix:
     type: streamable-http
     url: http://zabbix-mcp:8443/mcp
@@ -32,14 +42,5 @@ mcpServers:
       Authorization: 'Bearer ${ZABBIX_MCP_TOKEN}'
     # Zabbix MCP uses a Bearer token, not OAuth. Without this line LibreChat probes the
     # server without headers, gets 401, decides "OAuth required" and loads zero tools.
-    requiresOAuth: false
-    timeout: 60000
-
-  # zabbix-helper: host_list (compact host list) + history_recent (last N minutes, summarized)
-  zabbix-helper:
-    type: streamable-http
-    url: http://zabbix-helper:8000/mcp
-    headers:
-      Authorization: 'Bearer ${ZABBIX_MCP_TOKEN}'
     requiresOAuth: false
     timeout: 60000

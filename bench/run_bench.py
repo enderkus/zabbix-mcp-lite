@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """Benchmark: can a local LLM answer Zabbix questions through MCP tools?
 
-Each question goes to an OpenAI-compatible endpoint (LM Studio) together with one of two
+Each question goes to an OpenAI-compatible endpoint (LM Studio) together with one of three
 tool sets. The tool calls are executed for real against the MCP servers, and the final
 answer is graded against ground truth read from the Zabbix API right after the run.
 
 Tool sets (tool names follow LibreChat's "<tool>_mcp_<server>" convention):
   official  official Zabbix MCP server: host_get, item_get, problem_get, trigger_get, history_get
-  helper    zabbix-helper host_list + history_recent, plus item_get, problem_get, trigger_get
+  helper    first attempt: host_list + history_recent from zabbix-mcp-lite, plus the official
+            item_get, problem_get, trigger_get (the model still has to pick the item)
+  lite      zabbix-mcp-lite only: host_list, problem_list, latest_data, metric_history
 
 Outcomes:
   PASS       answer contains the expected values
@@ -18,7 +20,7 @@ Outcomes:
   ERROR      request failed (e.g. context window exceeded)
 
 Usage:
-  python3 -I bench/run_bench.py --model qwen3.5-4b-mlx --toolset helper --runs 3
+  python3 -I bench/run_bench.py --model qwen3.5-4b-mlx --toolset lite --runs 3
   python3 -I bench/run_bench.py --report bench/results/*.jsonl
 """
 
@@ -58,11 +60,18 @@ PROMPTS = {
     + "- Host saymak, listelemek veya host ID bulmak için host_list kullan. item_get'i her zaman hostids ile çağır.\n"
     + "- Geçmiş değer sorularında (son 1 saat, son 1 gün gibi) history_recent kullan; zaman damgası hesaplama.\n"
     + PROMPT_COMMON_TAIL,
+    "lite": PROMPT_COMMON_HEAD
+    + "- Hostlar için host_list, aktif problemler için problem_list kullan.\n"
+    + "- Bir metriğin geçmiş değerleri için (son 1 saat, son 24 saat gibi) metric_history, "
+      "anlık değerleri için latest_data kullan.\n"
+    + "- Araçların döndürdüğü değerleri birimleriyle aynen aktar.\n"
+    + "- Cevapları kısa ve Türkçe ver.",
 }
 TOOLSETS = {
     "official": {"zabbix": ["host_get", "item_get", "problem_get", "trigger_get", "history_get"]},
     "helper": {"zabbix": ["item_get", "problem_get", "trigger_get"],
                "zabbix-helper": ["host_list", "history_recent"]},
+    "lite": {"zabbix-lite": ["host_list", "problem_list", "latest_data", "metric_history"]},
 }
 NEGATIONS = ("yok", "bulunmuyor", "bulunmamakta", "hayır", "no active", "none", "there are no")
 
@@ -132,7 +141,8 @@ def grade(qid, answer, truth):
 
 # ------------------------------------------------------------------ one question
 def load_tools(args, toolset):
-    servers = {"zabbix": args.zabbix_mcp, "zabbix-helper": args.helper_mcp}
+    servers = {"zabbix": args.zabbix_mcp, "zabbix-helper": args.lite_mcp,
+               "zabbix-lite": args.lite_mcp}
     tools, route = [], {}
     for server, wanted in TOOLSETS[toolset].items():
         for t in mcp_call(servers[server], args.token, "tools/list", {})["tools"]:
@@ -182,7 +192,8 @@ def run_question(args, toolset, tools, route, question):
                 except Exception as exc:  # noqa: BLE001
                     result, text = {"isError": True}, f"Tool call failed: {exc}"
                 rec["tool_calls"].append({"name": name, "args": tc["function"]["arguments"],
-                                          "error": bool(result.get("isError")), "chars": len(text)})
+                                          "error": bool(result.get("isError")), "chars": len(text),
+                                          "result": text[:1500]})
                 msgs.append({"role": "tool", "tool_call_id": tc["id"], "content": text})
         else:
             outcome = "TIMEOUT"  # too many tool rounds
@@ -216,7 +227,7 @@ def report(paths):
     print("| Model | Tool set | " + " | ".join(qids) + " | Total | Median time |")
     print("|---|---|" + "---|" * len(qids) + "---|---|")
     for model in models:
-        for toolset in ("official", "helper"):
+        for toolset in TOOLSETS:
             runs = [r for r in rows if r["model"] == model and r["toolset"] == toolset]
             if not runs:
                 continue
@@ -255,7 +266,7 @@ def main():
     ap.add_argument("--report", nargs="*", help="print a summary table of JSONL result files")
     ap.add_argument("--llm-url", default="http://127.0.0.1:1234/v1")
     ap.add_argument("--zabbix-mcp", default="http://127.0.0.1:8443/mcp")
-    ap.add_argument("--helper-mcp", default="http://127.0.0.1:8001/mcp")
+    ap.add_argument("--lite-mcp", "--helper-mcp", dest="lite_mcp", default="http://127.0.0.1:8001/mcp")
     ap.add_argument("--zabbix-api", default="http://127.0.0.1:8080/api_jsonrpc.php")
     ap.add_argument("--env-file", default=str(ROOT / "librechat.env"))
     ap.add_argument("--max-tokens", type=int, default=4096, help="per model request")

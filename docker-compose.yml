@@ -1,9 +1,9 @@
-# Zabbix 8.0 + official Zabbix MCP server + zabbix-helper MCP + LibreChat, for a local LLM
+# Zabbix 8.0 + zabbix-mcp-lite (+ the official Zabbix MCP server) + LibreChat, for a local LLM
 #
 #   Zabbix web     : http://localhost:8080        (Admin / zabbix - change it!)
 #   LibreChat      : http://localhost:3080
 #   Zabbix MCP     : http://127.0.0.1:8443/mcp    (for local testing)
-#   zabbix-helper  : http://127.0.0.1:8001/mcp    (for local testing)
+#   zabbix-mcp-lite: http://127.0.0.1:8001/mcp    (for local testing)
 #
 # The LLM runs on the host in LM Studio; containers reach it at host.docker.internal:1234.
 
@@ -101,13 +101,13 @@ services:
       - "127.0.0.1:8443:8443"
     networks: [zabbix-ai]
 
-  # ---------------------------------------------------------------- zabbix-helper MCP
-  # host_list (compact host list) + history_recent (last N minutes, summarized).
-  # Lets a small model skip Unix timestamps / averages and avoids huge tool responses.
+  # ---------------------------------------------------------------- zabbix-mcp-lite
+  # Zabbix MCP server for small local models: host_list, problem_list, latest_data,
+  # metric_history. Finds the right item, computes time ranges and statistics itself.
   # Stores no token: forwards the client's Authorization header to the Zabbix API.
-  zabbix-helper:
-    build: ./zabbix-helper
-    image: zabbix-ai/zabbix-helper:local
+  zabbix-mcp-lite:
+    build: ./zabbix-mcp-lite
+    image: zabbix-ai/zabbix-mcp-lite:local
     restart: unless-stopped
     depends_on: [zabbix-web]
     environment:
@@ -129,7 +129,7 @@ services:
   librechat:
     image: registry.librechat.ai/librechat-ai/librechat-dev:latest
     restart: unless-stopped
-    depends_on: [librechat-mongodb, zabbix-mcp, zabbix-helper]
+    depends_on: [librechat-mongodb, zabbix-mcp, zabbix-mcp-lite]
     env_file: librechat.env
     ports:
       - "${BIND_ADDR:-127.0.0.1}:3080:3080"

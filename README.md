@@ -1,24 +1,25 @@
-# Zabbix MCP + a local LLM
+# Zabbix MCP for small local LLMs
 
 **English** · [Türkçe](README.tr.md)
 
 Ask Zabbix questions in plain language to a small LLM running on your own machine. No cloud,
 no API bill. This repository contains:
 
-- a **Docker stack**: Zabbix 8.0, the **official Zabbix MCP server**, and LibreChat connected
-  to a model in LM Studio
-- **zabbix-helper**, a small MCP server I wrote so that 4B-class models answer **correctly
-  and fast**
-- a **reproducible benchmark** that measures this with automatic grading against the Zabbix API
+- **zabbix-mcp-lite**: an MCP server for Zabbix 8.0 built for 4B-class models. The model only
+  says *"cpu, last 60 minutes"*. The server finds the item, works out the time range and computes
+  the statistics.
+- a **Docker stack**: Zabbix 8.0, zabbix-mcp-lite, the official Zabbix MCP server (for
+  comparison) and LibreChat connected to a model in LM Studio
+- a **reproducible benchmark** that grades the answers automatically against the Zabbix API
 
 ```mermaid
 flowchart LR
   U[User] --> LC[LibreChat :3080]
   LC -- OpenAI API --> LM[LM Studio :1234<br/>local LLM]
-  LC -- MCP --> ZM[Official Zabbix MCP :8443<br/>read-only *_get tools]
-  LC -- MCP --> ZH[zabbix-helper :8000<br/>host_list, history_recent]
-  ZM -- API token --> ZA[Zabbix 8.0 API]
-  ZH -- same token --> ZA
+  LC -- MCP --> ZL[zabbix-mcp-lite :8000<br/>host_list, problem_list,<br/>latest_data, metric_history]
+  ZL -- API token --> ZA[Zabbix 8.0 API]
+  LC -. MCP, optional .-> ZM[Official Zabbix MCP :8443]
+  ZM -. same token .-> ZA
 ```
 
 ## Why this was needed
@@ -30,76 +31,127 @@ MacBook Pro M4 with 16 GB RAM) the answers were wrong, empty, or took minutes:
 |---|---|
 | **Unix timestamps** | `history_get` requires `time_from` / `time_till` as Unix time. Qwen3.5 4B knew the date (`2026-11-06T12:33Z`) but converted it to `1732068549`, which is **November 2024**. Zabbix rejected it ("earlier than 7 days ago") and the model looped on the same wrong arithmetic for 4 minutes. |
 | **Huge tool responses** | `host_get` returns every host with all of its triggers: **~16 KB (~4,500 tokens) for a single host** with 83 triggers. With `MaxResponseSize=16K` the result came back empty and the model said "there are 0 hosts". At 32K only about two hosts fit. |
-| **Numbers reinterpreted** | The model read a raw average of `0.8166` as **"81.66 %"**. |
-| **Lost in large contexts** | Searching items without a host ID returns template items too (65 results, ~15k tokens). The model then thought for 6,000 tokens and returned nothing. |
+| **Picking the item** | A host has ~150 items, and 15 of them contain "CPU". Models searched for "CPU usage" (the item is called *CPU utilization*), took the first match (*CPU guest nice time*), or searched without a host and got template items with no data. |
+| **Numbers reinterpreted** | A model read a raw average of `0.8166` as **"81.66 %"**. |
+| **Lost in large contexts** | Searching items without a host ID returned 65 results (~15k tokens). The model then thought for 6,000 tokens and returned nothing. |
 
-These are not prompt problems: a 4B model cannot reliably do date arithmetic or averages, and
-the more tokens a tool returns, the more likely it gets lost.
+Better prompts don't fix this. A 4B model cannot reliably do date arithmetic or averages, or
+choose between 15 similar items, and the more tokens a tool returns, the more likely it gets lost.
 
-## The fix: zabbix-helper
+## zabbix-mcp-lite
 
-A ~200-line MCP server ([`zabbix-helper/server.py`](zabbix-helper/server.py)) that does the
-work the model cannot do, and returns short, ready-to-quote answers:
+A single MCP server ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py), ~500 lines of
+Python, one dependency) that does the work the model cannot do and returns short,
+ready-to-quote answers:
 
-| Tool | Replaces | What it does |
+| Tool | Replaces (official) | What it does |
 |---|---|---|
-| `host_list` | `host_get` | Returns only ID, names, status and agent availability (~200 characters instead of ~16,000). Does not break as you add hosts. |
-| `history_recent` | `history_get` | The model only says "last 60 minutes". The server computes the time range, finds the value type and returns **min / avg / max / last** with units (`"0.78 %"`, `"6.34 GB"`). |
+| `host_list` | `host_get` | Count, names, monitoring status and agent availability: ~200 characters instead of ~16,000 per host |
+| `problem_list` | `problem_get` + `trigger_get` | Active problems with host, severity, start time and duration, plus a one-line summary such as "There are no active problems." |
+| `latest_data` | `item_get` | Current values with units for a metric in plain words, or an overview of the main metrics of a host |
+| `metric_history` | `item_get` + `history_get` | Min / avg / max / last over the last N minutes. Finds the item and the time range itself |
 
-Design choices:
+A fifth tool, `history_recent`, returns the same statistics for explicit item IDs (advanced use).
 
-- **Stores no token.** It forwards the client's `Authorization: Bearer` header to the Zabbix
-  API, so Zabbix enforces the same read-only permissions as for the official MCP server.
-- **Calls the Zabbix API directly**, so it is not bound by the MCP server's response size limit.
-- The official Zabbix MCP server stays in place for everything else (problems, triggers, items).
+```text
+metric_history(host="Zabbix server", metric="cpu", minutes=60)
+
+{"host": "Zabbix server",
+ "range": {"from": "2026-11-06 19:38:05", "till": "2026-11-06 20:38:05", "minutes": 60,
+           "timezone": "Europe/Istanbul"},
+ "items": [{"itemid": "42269", "name": "CPU utilization", "key": "system.cpu.util",
+            "count": 60, "min": "0.47 %", "avg": "0.56 %", "max": "1.41 %", "last": "1.41 %",
+            "summary": "CPU utilization: average 0.56 %, maximum 1.41 %, minimum 0.47 %,
+                        last 1.41 % (60 values, 2026-11-06 19:38:24 - 2026-11-06 20:37:24)."}]}
+```
+
+**How it finds the item.**
+
+- **Plain words map to the standard template items:** *cpu* → `system.cpu.util`, *memory* /
+  *ram* → `vm.memory.util`, *disk* → `vfs.fs…[…,pused]`, *network* → bits received and sent.
+  The same goes for *load*, *swap*, *uptime*, *processes* and *ping*.
+- **Turkish works too, including suffixes:** *işlemci*, *belleği*, *ağ trafiği*,
+  *kullanılabilir bellek*.
+- **More specific requests fall back to the words in item names and keys:** *cpu iowait* →
+  *CPU iowait time*, *available memory* → *Available memory*.
+- **Hosts are matched loosely**, so "Zabbix server'ın" also works. With a single host, the host
+  can be left out.
+- **When nothing matches, the error says what to try** (for example the list of hosts) instead
+  of a bare failure.
+
+**Design choices.**
+
+- **Stores no token.** It forwards the client's `Authorization: Bearer` header to the Zabbix API,
+  so Zabbix enforces that token's permissions. It only calls read methods: `host.get`,
+  `item.get`, `history.get`, `problem.get` and `trigger.get`.
+- **Answers carry units** (`0.55 %`, `6.42 GB`, `2.62 Kbps`, `3h 51m`), so the model does not
+  reinterpret the numbers.
+- **Responses are small by design**, a few hundred characters, so there is no response size
+  limit to tune.
 
 ## Results
 
-Same four questions, same agent instructions. The only difference is the tool set:
-**official** gives the model the official MCP tools; **helper** swaps `host_get` / `history_get` for
-`host_list` / `history_recent`.
+The same four questions on the same machine, with three tool sets, each with its own agent
+instructions:
 
-- **History questions** (CPU over the last hour, memory over the last 24 hours): no model answered
-  a single one correctly with the official tools. With zabbix-helper: **9 of 16** correct.
-- **Qwen3.5 4B**: from **6/12 to 10/12**, and the median time per question dropped from
-  **73 s to 13 s**.
-- Host count and active problems were answered correctly every time with both tool sets. The
-  official server is fine for simple lookups.
+- **official**: the official MCP server's tools (`host_get`, `item_get`, `problem_get`,
+  `trigger_get`, `history_get`)
+- **helper**: my first attempt, the official tools plus `host_list` and `history_recent`. The
+  model still had to pick the item with `item_get`.
+- **lite**: zabbix-mcp-lite alone (`host_list`, `problem_list`, `latest_data`, `metric_history`)
+
+Highlights:
+
+- **History questions** (CPU over the last hour, memory over the last 24 hours), all four
+  models: **0/16** with the official tools, **9/16** with the first attempt, **16/16** with
+  zabbix-mcp-lite.
+- **All questions: 32/32** with zabbix-mcp-lite, for every model. That includes Qwen3 4B 2507,
+  which made up values with the official tools.
+- **Qwen3.5 4B**: 6/12 → 10/12 → **12/12**. The median time per question went from
+  **73 s → 13 s → 10 s**, and a history question is usually a single tool call.
+- **Gemma 4 12B**: the median time went from 180 s to 23 s.
 
 | Model | Tool set | Host count | Active problems | CPU, last 1 h | Memory, last 24 h | Total | Median time |
 |---|---|---|---|---|---|---|---|
-| Qwen3.5 4B | official | 3/3 (27 s) | 3/3 (13 s) | 0/3 (117 s) | 0/3 (172 s) | **6/12** | 73 s |
-| Qwen3.5 4B | **helper** | 3/3 (7 s) | 3/3 (8 s) | 2/3 (79 s) | 2/3 (20 s) | **10/12** | **13 s** |
-| Qwen3 4B 2507 | official | 2/2 (21 s) | 2/2 (7 s) | 0/2 (32 s) | 0/2 (33 s) | **4/8** | 22 s |
-| Qwen3 4B 2507 | **helper** | 2/2 (7 s) | 2/2 (6 s) | 0/2 (8 s) | 2/2 (12 s) | **6/8** | 7 s |
-| Qwen3 4B Thinking 2507 | official | 1/1 (81 s) | 1/1 (48 s) | 0/1 (240 s) | 0/1 (240 s) | **2/4** | 160 s |
-| Qwen3 4B Thinking 2507 | **helper** | 1/1 (38 s) | 1/1 (54 s) | 0/1 (170 s) | 0/1 (198 s) | **2/4** | 112 s |
-| Gemma 4 12B | official | 2/2 (103 s) | 2/2 (36 s) | 0/2 (240 s) | 0/2 (240 s) | **4/8** | 180 s |
-| Gemma 4 12B | **helper** | 2/2 (35 s) | 2/2 (29 s) | 1/2 (85 s) | 2/2 (63 s) | **7/8** | 48 s |
+| Qwen3.5 4B | official | 3/3 (27 s) | 3/3 (13 s) | 0/3 (117 s) | 0/3 (172 s) | 6/12 | 73 s |
+| Qwen3.5 4B | helper | 3/3 (7 s) | 3/3 (8 s) | 2/3 (79 s) | 2/3 (20 s) | 10/12 | 13 s |
+| Qwen3.5 4B | **lite** | 3/3 (6 s) | 3/3 (4 s) | 3/3 (11 s) | 3/3 (12 s) | **12/12** | **10 s** |
+| Qwen3 4B 2507 | official | 2/2 (21 s) | 2/2 (7 s) | 0/2 (32 s) | 0/2 (33 s) | 4/8 | 22 s |
+| Qwen3 4B 2507 | helper | 2/2 (7 s) | 2/2 (6 s) | 0/2 (8 s) | 2/2 (12 s) | 6/8 | 7 s |
+| Qwen3 4B 2507 | **lite** | 2/2 (4 s) | 2/2 (4 s) | 2/2 (8 s) | 2/2 (9 s) | **8/8** | **6 s** |
+| Qwen3 4B Thinking 2507 | official | 1/1 (81 s) | 1/1 (48 s) | 0/1 (240 s) | 0/1 (240 s) | 2/4 | 160 s |
+| Qwen3 4B Thinking 2507 | helper | 1/1 (38 s) | 1/1 (54 s) | 0/1 (170 s) | 0/1 (198 s) | 2/4 | 112 s |
+| Qwen3 4B Thinking 2507 | **lite** | 1/1 (18 s) | 1/1 (18 s) | 1/1 (30 s) | 1/1 (53 s) | **4/4** | **24 s** |
+| Gemma 4 12B | official | 2/2 (103 s) | 2/2 (36 s) | 0/2 (240 s) | 0/2 (240 s) | 4/8 | 180 s |
+| Gemma 4 12B | helper | 2/2 (35 s) | 2/2 (29 s) | 1/2 (85 s) | 2/2 (63 s) | 7/8 | 48 s |
+| Gemma 4 12B | **lite** | 2/2 (17 s) | 2/2 (13 s) | 2/2 (30 s) | 2/2 (37 s) | **8/8** | **23 s** |
 
 Cells show *correct / runs (median seconds)*. Each question had a limit of 240 s.
 
 **How it failed with the official tools.** Models computed wrong Unix timestamps that
-`history_get` rejected, or kept thinking until the token budget ran out, sometimes before
-calling any tool, and returned nothing (Qwen3.5 4B: 5× no answer). Others ran into the 240 s limit (Gemma, Qwen3 Thinking: 6×).
-Qwen3 4B 2507 answered quickly but wrongly, and once **made up the values** ("average 45.2 %"; the
-real value was 0.71 %).
+`history_get` rejected. Others kept thinking until the token budget ran out, sometimes before
+calling any tool, and returned nothing (Qwen3.5 4B: 5× no answer). Others ran into the 240 s limit
+(Gemma, Qwen3 Thinking: 6×). Qwen3 4B 2507 answered quickly but wrongly, and once **made up the
+values** ("average 45.2 %"; the real value was 0.71 %).
 
-**How it still fails with zabbix-helper.** All 7 remaining failures happen *before* history is
-read, while picking the item:
+**How the first attempt still failed.** `history_recent` removed the timestamp problem, but all
+7 remaining failures happened while picking the item:
 
-- Qwen3 4B 2507 searched for "CPU usage", but the item is named "CPU utilization". It found
-  nothing and gave up (2×).
-- Qwen3 4B Thinking called `item_get` with `limit: 1` and used the first match: *CPU guest nice
-  time* and *Available memory*. The values were right, but for the wrong metric (2×).
-- Qwen3.5 4B called `item_get` without `hostids` despite the instructions, got template items
-  that have no data, and reported "no data" or nothing (2×).
-- Gemma picked the right item and the exact maximum, but its average was 0.96 % vs 0.88 %.¹
+- Qwen3 4B 2507 searched for "CPU usage" (the item is *CPU utilization*) and gave up (2×).
+- Qwen3 4B Thinking used `limit: 1` and got *CPU guest nice time* and *Available memory* (2×).
+- Qwen3.5 4B searched without `hostids` and got template items with no data (2×).
+- Gemma's average was off by 9 %.¹
 
-A tool that maps "CPU" or "memory" to the right item of a host is the obvious next step.
+zabbix-mcp-lite removes this step: `metric_history(metric="cpu")` picks the item on the server.
 
-**Recommendation:** Qwen3.5 4B with zabbix-helper scored best and was fastest. Gemma 4 12B is
-almost as accurate (7/8), but about 4× slower and uses 6.8 GB of RAM instead of 3.1 GB.
+**Recommendation:** Qwen3.5 4B with zabbix-mcp-lite: 12/12, about 10 s per answer, 3.1 GB of
+RAM. Qwen3 4B 2507 was also 8/8 and a bit faster. Gemma 4 12B is just as accurate, but about
+2× slower and uses 6.8 GB.
+
+**Read this with care.** These are four questions on a lab Zabbix with one host, and only 1–3
+runs per cell. The plain-word table maps *cpu* and *memory* to the same standard items that the
+grader reads. So this shows the whole path works end to end for typical questions, not that
+every question will be answered correctly.
 
 <details>
 <summary>Test setup</summary>
@@ -108,11 +160,15 @@ almost as accurate (7/8), but about 4× slower and uses 6.8 GB of RAM instead of
 - Context: 32K for the 4B models, 16K for Gemma 4 12B (to leave memory for Docker on a 16 GB machine)
 - Runs per tool set: 3 (Qwen3.5 4B), 2 (Qwen3 4B 2507, Gemma), 1 (Qwen3 Thinking)
 - Per question: at most 8 tool-call rounds, 4,096 tokens per model reply, 240 s in total
-- Zabbix 8.0.0, one host (*Zabbix server* monitoring itself), no active problems; run on 2026-11-06
-- Raw results: [`bench/results/20261106-160552.jsonl`](bench/results/20261106-160552.jsonl)
+- Zabbix 8.0.0, one host (*Zabbix server* monitoring itself), no active problems
+- All runs were on 2026-11-06. *official* and *helper* ran first; *lite* ran about four hours
+  later, and its records also contain every tool result.
+- Raw results: [`20261106-160552.jsonl`](bench/results/20261106-160552.jsonl) (official,
+  helper), [`20261106-202808.jsonl`](bench/results/20261106-202808.jsonl) (lite)
+- The *helper* rows were measured with the first version of the server (commit `e7b1fce`)
 
-¹ The Mac went to sleep once during the run. The record that ran while it slept (a timeout shown as
-8,367 s) was rerun and timed out again. The Gemma CPU failure above ran right after wake-up,
+¹ The Mac went to sleep once during the first run. The record that ran while it slept (a timeout
+shown as 8,367 s) was rerun and timed out again. The Gemma CPU failure ran right after wake-up,
 when the last hour had only 4 samples. One new sample can then shift the average by more than the
 8 % tolerance. It is still counted as a failure.
 
@@ -138,6 +194,9 @@ Things that cost time and are not obvious from the documentation:
    the response says `truncated: true` with zero results, and models report "0 hosts".
 7. **Small models need the current date.** LibreChat replaces `{{iso_datetime}}` in agent
    instructions with the real date on every message.
+8. **The MCP Python SDK 2.x hides exception messages from the model.** Only a `ToolError`
+   reaches the client; anything else becomes a bare `Error executing tool <name>`. Errors that
+   tell the model what to do next ("Hosts: Zabbix server") must be raised as `ToolError`.
 
 ## Quick start
 
@@ -152,13 +211,13 @@ cd zabbix-mcp-local-llm
 cp .env.example .env
 cp librechat.env.example librechat.env
 
-# 2. Start Zabbix, the official MCP server and zabbix-helper
-docker compose up -d zabbix-db zabbix-server zabbix-web zabbix-agent zabbix-mcp zabbix-helper
+# 2. Start Zabbix and zabbix-mcp-lite
+docker compose up -d zabbix-db zabbix-server zabbix-web zabbix-agent zabbix-mcp-lite
 
 # 3. Create the read-only mcp-reader user, its role and API token (written to librechat.env)
 python3 -I setup_zabbix.py
 
-# 4. Start LibreChat
+# 4. Start LibreChat (also starts the official Zabbix MCP server, which is optional)
 docker compose up -d librechat
 ```
 
@@ -169,16 +228,16 @@ Then:
    `ALLOW_REGISTRATION=false` in `librechat.env` and run `docker compose up -d librechat`.
 3. Create an **agent** in LibreChat:
    - Model: *LM Studio* → `qwen3.5-4b-mlx`
-   - Tools: `host_list` and `history_recent` from **zabbix-helper**; `item_get`, `problem_get`
-     and `trigger_get` from **zabbix**
+   - Tools: from **zabbix-lite** only: `host_list`, `problem_list`, `latest_data`,
+     `metric_history`
    - Instructions (used in the benchmark, Turkish answers):
 
      ```
      Sen bir Zabbix asistanısın. Şu anki tarih ve saat: {{iso_datetime}}.
      - Zabbix ile ilgili her soruda önce araç çağır, asla tahmin etme.
-     - Host saymak, listelemek veya host ID bulmak için host_list kullan. item_get'i her zaman hostids ile çağır.
-     - Geçmiş değer sorularında (son 1 saat, son 1 gün gibi) history_recent kullan; zaman damgası hesaplama.
-     - Trigger tanımlarını problem gibi sunma; aktif problemler için problem_get kullan.
+     - Hostlar için host_list, aktif problemler için problem_list kullan.
+     - Bir metriğin geçmiş değerleri için (son 1 saat, son 24 saat gibi) metric_history, anlık değerleri için latest_data kullan.
+     - Araçların döndürdüğü değerleri birimleriyle aynen aktar.
      - Cevapları kısa ve Türkçe ver.
      ```
 
@@ -187,46 +246,82 @@ Then:
      ```
      You are a Zabbix assistant. Current date and time: {{iso_datetime}}.
      - For every Zabbix question, call a tool first; never guess.
-     - Use host_list to count or list hosts or to find a host ID. Always call item_get with hostids.
-     - For history questions (last hour, last day, ...) use history_recent; do not compute timestamps.
-     - Do not present trigger definitions as problems; use problem_get for active problems.
+     - Use host_list for hosts and problem_list for active problems.
+     - Use metric_history for values over time (last hour, last 24 hours, ...) and latest_data for current values.
+     - Quote the values returned by the tools as they are, with their units.
      - Keep answers short.
      ```
+
+Example questions: *"Are there any active problems?"*, *"How was the CPU usage of Zabbix
+server in the last hour?"*, *"Memory over the last 24 hours?"*, *"How is Zabbix server doing
+right now?"*, *"Disk usage?"*.
+
+## Using zabbix-mcp-lite with your own Zabbix
+
+The server works with any MCP client that supports streamable HTTP and custom headers:
+
+```bash
+docker build -t zabbix-mcp-lite ./zabbix-mcp-lite
+docker run -d --name zabbix-mcp-lite -p 127.0.0.1:8001:8000 \
+  -e ZABBIX_API_URL=https://zabbix.example.com/api_jsonrpc.php \
+  -e TZ=Europe/Istanbul \
+  -e ALLOWED_HOSTS=127.0.0.1:8001,localhost:8001 \
+  zabbix-mcp-lite
+```
+
+- **Endpoint:** `http://127.0.0.1:8001/mcp`, with the header
+  `Authorization: Bearer <Zabbix API token>`.
+- **The token's user needs API access** to the read methods listed above. See
+  [`setup_zabbix.py`](setup_zabbix.py) for a minimal role.
+- **`ALLOWED_HOSTS`** is the list of `Host` headers the server accepts (DNS rebinding
+  protection). Add the name your client uses to reach it.
 
 ## Reproducing the benchmark
 
 ```bash
 # one model and tool set (the model must be loaded in LM Studio)
-python3 -I bench/run_bench.py --model qwen3.5-4b-mlx --toolset helper --runs 3
+python3 -I bench/run_bench.py --model qwen3.5-4b-mlx --toolset lite --runs 3
 
 # the full matrix: loads each model in turn with lms, then prints the summary table
-bash bench/run_all.sh
+caffeinate -i bash bench/run_all.sh          # macOS: keep the machine awake
+TOOLSETS=lite bash bench/run_all.sh          # only some tool sets
 
 # summary table of existing results
 python3 -I bench/run_bench.py --report bench/results/*.jsonl
 ```
 
-Each question is sent with the tool definitions and the agent instructions above. Tool calls
-are executed for real, and the final answer is graded against values read from the Zabbix API
-right after the run (host count and names; "no problems"; average **and** maximum within ±8 %).
+Each question is sent with the tool definitions and the agent instructions of its tool set
+(see `PROMPTS` in [`bench/run_bench.py`](bench/run_bench.py)). Tool calls are executed for
+real. The final answer is graded against values read from the Zabbix API right after the run:
+
+- host count and names
+- "no problems"
+- average **and** maximum within ±8 %
+
 Raw results, including every tool call and answer, are in [`bench/results/`](bench/results/).
 
 ## Security notes
 
-- Everything is **read-only**: the MCP server exposes only `*_get` tools, and the token belongs
-  to a user whose role allows only 12 read API methods. zabbix-helper uses the same token.
-- MCP ports are bound to `127.0.0.1`; the web UIs too, unless you set `BIND_ADDR`.
+- **Everything is read-only.** zabbix-mcp-lite only calls read methods, the official MCP server
+  exposes only `*_get` tools, and the token belongs to a user whose role allows only 12 read API
+  methods.
+- **Ports are bound to `127.0.0.1`.** The MCP ports always are; the web UIs are too, unless you
+  set `BIND_ADDR`.
 - **Change the Zabbix `Admin` / `zabbix` password** before exposing anything.
-- Secrets live in `.env` and `librechat.env`, which are git-ignored.
+- **Secrets live in `.env` and `librechat.env`**, which are git-ignored.
 
 ## Limitations
 
-- Tested on one machine (MacBook Pro M4, 16 GB) with a lab Zabbix that monitors only itself.
-  Numbers will differ on other hardware and on real environments with many hosts.
-- A 4B model still makes mistakes. Check important values in the Zabbix UI
+- **Tested on one machine**, a MacBook Pro M4 with 16 GB, with a lab Zabbix that monitors only
+  itself. Numbers will differ on other hardware and on real environments with many hosts.
+- **The plain-word table targets the standard agent templates** (*Linux by Zabbix agent*,
+  *Windows by Zabbix agent*). With other templates (SNMP, cloud), matching falls back to the
+  words in item names. That works for English names but is less precise.
+- **History covers the last 7 days** and is read from raw history (no trends).
+- **A 4B model still makes mistakes.** Check important values in the Zabbix UI
   (*Monitoring → Latest data*).
-- zabbix-helper is not an official Zabbix component; it may need updates for future Zabbix
-  API changes.
+- **zabbix-mcp-lite is not an official Zabbix component.** It may need updates for future
+  Zabbix API changes.
 
 ## License
 

@@ -21,7 +21,8 @@ ENV_FILE = Path(__file__).resolve().parent / "librechat.env"
 GROUP_NAME = "MCP read-only"
 ROLE_NAME = "MCP read-only role"
 USERNAME = "mcp-reader"
-# Zabbix API methods behind the MCP read tools (zabbix-helper uses host/item/history.get)
+# Zabbix API methods behind the official MCP read tools
+# (zabbix-mcp-lite needs only host.get, item.get, history.get, problem.get, trigger.get)
 READ_METHODS = [
     "hostgroup.get", "templategroup.get", "host.get", "template.get", "item.get",
     "discoveryrule.get", "hostinterface.get", "usermacro.get", "problem.get",
