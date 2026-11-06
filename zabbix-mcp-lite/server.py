@@ -220,7 +220,7 @@ STOPWORDS = set("""
 a an the of on in at for to and or is are what how much many show me
 usage use used using utilization utilisation util percent percentage pct
 value values current currently now latest last recent average avg mean max maximum min
-minimum peak history trend over during past total level status
+minimum peak history trend over during past level
 host server sunucu sunucusu sunucunun sistem sistemi system
 kullanim kullanimi kullanimini kullanma orani oran orani yuzde yuzdesi yuzdelik
 deger degeri degerleri nedir nasil ne kadar son su an anlik simdi ortalama ortalamasi
@@ -233,36 +233,40 @@ hour hours day days minute minutes week
 #   companion  words allowed next to it ("cpu load" is still the load concept)
 #   keys       item key regexps (full match), best first
 #   names      item name fragments, used when no key matches (other templates)
+#   family     item keys of the same kind; preferred when the request is more specific
+#              ("disk free" -> a vfs.fs item, not "Free swap space")
 CONCEPTS = [
     {"primary": {"load", "yuk", "loadavg"}, "companion": {"cpu", "islemci"},
      "keys": [r"system\.cpu\.load\[(all|percpu)?,avg1\]", r"system\.cpu\.load(\[.*\])?"],
-     "names": ["load average"]},
+     "names": ["load average"], "family": r"system\.cpu\.load.*"},
     {"primary": {"swap", "takas"}, "companion": {"free", "bos"},
      "keys": [r"system\.swap\.size\[,pfree\]", r"system\.swap\.pfree"],
-     "names": ["free swap space in %"]},
+     "names": ["free swap space in %"], "family": r"system\.swap\..*"},
     {"primary": {"disk", "fs", "filesystem", "storage", "depolama", "dosya", "space", "alan"},
      "companion": {"doluluk", "dolu", "kullanilan", "alani"},
      "keys": [r"vfs\.fs\.(dependent\.)?size\[.*,pused\]"],
-     "names": ["space: used, in %", "used, in %"]},
+     "names": ["space: used, in %", "used, in %"], "family": r"vfs\.(fs|dev)\..*"},
     {"primary": {"network", "net", "ag", "trafik", "traffic", "bandwidth", "bant",
                  "interface", "arayuz"},
      "companion": {"genisligi", "in", "out", "gelen", "giden"},
      "keys": [r"net\.if(\.get)?\.(in|out)\[[^,\]]*\]"],
-     "names": ["bits received", "bits sent"]},
+     "names": ["bits received", "bits sent"], "family": r"net\.if\..*"},
     {"primary": {"memory", "mem", "ram", "bellek", "hafiza"}, "companion": set(),
      "keys": [r"vm\.memory\.(util|utilization)", r"vm\.memory\.size\[pused\]"],
-     "names": ["memory utilization"]},
+     "names": ["memory utilization"], "family": r"vm\.memory\..*"},
     {"primary": {"cpu", "islemci"}, "companion": set(),
      "keys": [r"system\.cpu\.util", r"system\.cpu\.util\[,,avg1\]"],
-     "names": ["cpu utilization"]},
+     "names": ["cpu utilization"], "family": r"system\.cpu\..*"},
     {"primary": {"uptime"}, "companion": set(),
-     "keys": [r"system\.uptime"], "names": ["system uptime", "uptime"]},
+     "keys": [r"system\.uptime"], "names": ["system uptime", "uptime"],
+     "family": r"system\.(uptime|boottime)"},
     {"primary": {"process", "processes", "proses", "surec"}, "companion": {"sayisi", "number"},
-     "keys": [r"proc\.num"], "names": ["number of processes"]},
+     "keys": [r"proc\.num"], "names": ["number of processes"], "family": r"proc\..*"},
     {"primary": {"ping", "reachable", "erisilebilir", "erisim", "availability"},
      "companion": {"agent"},
      "keys": [r"agent\.ping", r"icmpping", r"zabbix\[host,agent,available\]"],
-     "names": ["agent ping", "icmp ping"]},
+     "names": ["agent ping", "icmp ping"],
+     "family": r"agent\.ping|icmpping.*|zabbix\[host,agent,available\]"},
 ]
 
 
@@ -299,6 +303,15 @@ TRANSLATE = {
 }
 
 
+# Words that mean the same in item names and keys ("free" disk space is "Space: Available")
+SYNONYMS = {"free": ("available", "pfree"), "available": ("free", "pavailable")}
+
+
+def _token_hits(tok: str, words: list[str]) -> bool:
+    candidates = (tok, *SYNONYMS.get(tok, ()))
+    return any(_word_match(c, w) for c in candidates for w in words)
+
+
 def _query_tokens(query: str, ignore: set[str]) -> list[str]:
     out = []
     for tok in _tokens(query):
@@ -327,10 +340,12 @@ def _concept_rank(item: dict, concept: dict) -> tuple | None:
 def _match_items(items: list[dict], query: str, ignore: set[str]) -> tuple[str, list[dict]]:
     """Return ("concept" | "words", items best first) for a plain-language metric name."""
     toks = _query_tokens(query, ignore)
+    family = None
     for concept in CONCEPTS:
         primary = [t for t in toks if any(_word_match(t, w) for w in concept["primary"])]
         if not primary:
             continue
+        family = concept["family"]
         allowed = concept["primary"] | concept["companion"]
         leftover = [t for t in toks if not any(_word_match(t, w) for w in allowed)]
         if leftover:
@@ -350,7 +365,9 @@ def _match_items(items: list[dict], query: str, ignore: set[str]) -> tuple[str, 
     scored = []
     for item in items:
         words = _tokens(_name(item) + " " + item["key_"])
-        hits = sum(any(_word_match(t, w) for w in words) for t in toks)
+        hits = sum(_token_hits(t, words) for t in toks)
+        if hits and family and re.fullmatch(family, item["key_"]):
+            hits += 1
         if hits:
             scored.append(((-hits, not _has_data(item), item["value_type"] not in NUMERIC,
                             len(_name(item)), _name(item)), item))
@@ -542,8 +559,9 @@ async def problem_list(host: HostParam = None, ctx: Context | None = None) -> di
 async def latest_data(
     host: HostParam = None,
     search: Annotated[str | None, Field(
-        description="Plain words for the metric, for example 'cpu', 'memory', 'disk', "
-                    "'network', 'uptime'. Leave empty for an overview of the main metrics.")] = None,
+        description="The metric in the user's own words, any language, for example 'cpu', "
+                    "'free memory', 'disk', 'ağ trafiği', 'uptime'. Leave empty for an overview "
+                    "of the main metrics.")] = None,
     ctx: Context | None = None,
 ) -> dict:
     """Current (latest) values of a host's metrics, like Monitoring > Latest data in Zabbix.
@@ -554,8 +572,9 @@ async def latest_data(
 @mcp.tool()
 async def metric_history(
     metric: Annotated[str, Field(
-        description="The metric in plain words, for example 'cpu', 'memory', 'disk', 'load', "
-                    "'network', 'swap'. The server finds the matching Zabbix item.")],
+        description="The metric in the user's own words, any language, for example 'cpu', "
+                    "'memory', 'free memory', 'disk', 'load', 'ağ trafiği'. The server finds "
+                    "the matching Zabbix item.")],
     host: HostParam = None,
     minutes: Annotated[int, Field(description="How many minutes back from now, 1-10080. "
                                               "Last hour = 60, last 24 hours = 1440.")] = 60,

@@ -1,4 +1,4 @@
-# Zabbix MCP for small local LLMs
+# zabbix-mcp-lite: Zabbix MCP for small local LLMs
 
 **English** · [Türkçe](README.tr.md)
 
@@ -88,6 +88,50 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
   reinterpret the numbers.
 - **Responses are small by design**, a few hundred characters, so there is no response size
   limit to tune.
+
+## What you can ask
+
+Four tools, but not four questions: `latest_data` and `metric_history` reach every item of every
+host the token can read, by plain words.
+
+| You ask | The model calls |
+|---|---|
+| "How many hosts are there?" "Is any host unreachable?" | `host_list` |
+| "Are there any problems?" "Any problems on Zabbix server?" | `problem_list` |
+| "How is Zabbix server doing right now?" | `latest_data`: CPU, memory, load, disk, swap, network, uptime, processes, ping |
+| "How much free memory is there?" "How much RAM in total?" "How full is the disk?" | `latest_data` / `metric_history` |
+| "CPU usage over the last hour?" "Memory over the last 24 hours?" | `metric_history` |
+| "Highest load average in the last 24 hours?" "Network traffic in the last hour?" "Swap over the last 3 hours?" | `metric_history` |
+| Any other item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, matched by the words in the item name |
+
+Before writing this list I asked the questions in the first six rows to Qwen3.5 4B with these
+tools, plus one about a host that does not exist. The last row was tested on the tools directly. The first round of 10 questions had 8 right answers and 2 failures:
+
+- One answer quoted the CPU value 0.63 % as "%63". The tool output was right, and reruns were
+  correct.
+- One answer searched for "swap" when asked about free memory. I then changed the tool
+  descriptions to "pass the user's own words", and the same question was answered correctly
+  3 of 3 times.
+
+**Why only four tools?** Every tool definition is sent to the model with every message. The
+official server's 12 tools take **3,618 tokens**; these four take **1,019** (Qwen3.5 4B
+tokenizer). On a laptop that is seconds of extra prompt processing per message, and a small model
+chooses better between 4 tools than between 12.
+
+## What it does not do (yet)
+
+- **No changes.** It cannot acknowledge or close problems, create maintenance periods or change
+  the configuration. It is read-only on purpose.
+- **No configuration questions** such as trigger expressions, templates, macros, users or host
+  groups. `host_list` filters by name only.
+- **Only active problems**, not the history of resolved ones.
+- **History covers the last 7 days**, from raw history (no trends, no graphs).
+- **One host per call.** "Which of 200 hosts has the highest CPU?" needs a call per host, and a
+  small model will not do that well.
+- **Text and log items** return their last five values only.
+
+Each of these would be a new tool, and every tool costs tokens on every message, so they are
+worth adding only where they are needed.
 
 ## Results
 
@@ -204,8 +248,8 @@ Requirements: Docker (tested with OrbStack on macOS), Python 3, and
 [LM Studio](https://lmstudio.ai) with its local server enabled on port 1234.
 
 ```bash
-git clone https://github.com/enderkus/zabbix-mcp-local-llm.git
-cd zabbix-mcp-local-llm
+git clone https://github.com/enderkus/zabbix-mcp-lite.git
+cd zabbix-mcp-lite
 
 # 1. Configuration: fill in the secrets (openssl commands are in the files)
 cp .env.example .env
@@ -318,8 +362,8 @@ Raw results, including every tool call and answer, are in [`bench/results/`](ben
   *Windows by Zabbix agent*). With other templates (SNMP, cloud), matching falls back to the
   words in item names. That works for English names but is less precise.
 - **History covers the last 7 days** and is read from raw history (no trends).
-- **A 4B model still makes mistakes.** Check important values in the Zabbix UI
-  (*Monitoring → Latest data*).
+- **A 4B model still makes mistakes**, even with correct tool output (one answer above quoted
+  0.63 % as "%63"). Check important values in the Zabbix UI (*Monitoring → Latest data*).
 - **zabbix-mcp-lite is not an official Zabbix component.** It may need updates for future
   Zabbix API changes.
 

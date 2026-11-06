@@ -1,4 +1,4 @@
-# Küçük yerel LLM'ler için Zabbix MCP
+# zabbix-mcp-lite: küçük yerel LLM'ler için Zabbix MCP
 
 [English](README.md) · **Türkçe**
 
@@ -90,6 +90,51 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
   yanlış yorumlamıyor.
 - **Cevaplar baştan küçük**, birkaç yüz karakter. Ayarlanması gereken bir cevap boyutu sınırı
   yok.
+
+## Neler sorabilirsin
+
+Dört araç var ama dört soru değil: `latest_data` ve `metric_history`, token'ın okuyabildiği her
+host'un her item'ına günlük dildeki sözcüklerle ulaşıyor.
+
+| Sen soruyorsun | Model şunu çağırıyor |
+|---|---|
+| "Kaç host var?" "Erişilemeyen host var mı?" | `host_list` |
+| "Aktif problem var mı?" "Zabbix server'da problem var mı?" | `problem_list` |
+| "Zabbix server şu an nasıl durumda?" | `latest_data`: CPU, bellek, load, disk, swap, ağ, uptime, process, ping |
+| "Ne kadar boş bellek var?" "Toplam ne kadar RAM var?" "Disk doluluğu ne kadar?" | `latest_data` / `metric_history` |
+| "Son 1 saatte CPU kullanımı?" "Son 24 saatte bellek?" | `metric_history` |
+| "Son 24 saatte en yüksek load average?" "Son 1 saatte ağ trafiği?" "Son 3 saatte swap?" | `metric_history` |
+| Başka herhangi bir item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, item adındaki sözcüklerle eşleşerek |
+
+Bu listeyi yazmadan önce ilk altı satırdaki soruları (ve olmayan bir host hakkında bir soruyu)
+bu araçlarla Qwen3.5 4B'ye sordum. Son satır doğrudan araçlar üzerinde test edildi.
+İlk turdaki 10 sorudan 8'i doğru cevaplandı, 2'si hatalıydı:
+
+- Bir cevapta CPU değeri 0.63 % yerine "%63" yazıldı. Aracın çıktısı doğruydu, tekrarlarda da
+  doğru yazıldı.
+- Bir cevapta boş bellek sorusu için "swap" arandı. Bunun üzerine araç açıklamalarını
+  "kullanıcının kendi sözcüklerini gönder" diye değiştirdim; aynı soru 3 denemenin 3'ünde de
+  doğru cevaplandı.
+
+**Neden sadece dört araç?** Her aracın tanımı her mesajla birlikte modele gönderiliyor. Resmi
+sunucunun 12 aracı **3.618 token**, bu dört araç **1.019 token** tutuyor (Qwen3.5 4B
+tokenizer'ı). Bir dizüstü bilgisayarda bu, her mesajda saniyelerce fazladan işlem demek. Ayrıca
+küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabetli seçim yapıyor.
+
+## Şimdilik yapmadıkları
+
+- **Değişiklik yapmıyor.** Problem onaylayamaz veya kapatamaz, bakım (maintenance) oluşturamaz,
+  yapılandırmayı değiştiremez. Bilerek salt okunur.
+- **Yapılandırma sorularını cevaplamıyor:** trigger ifadeleri, template'ler, makrolar,
+  kullanıcılar ya da host grupları gibi. `host_list` sadece ada göre filtreliyor.
+- **Sadece aktif problemleri gösteriyor**, çözülmüş problemlerin geçmişini değil.
+- **Geçmiş veri son 7 günle sınırlı**, ham history'den okunuyor (trend ve grafik yok).
+- **Her çağrıda tek host.** "200 host'tan hangisinin CPU'su en yüksek?" sorusu her host için ayrı
+  çağrı gerektirir; küçük bir model bunu iyi yapamaz.
+- **Metin ve log item'larında** sadece son beş değer dönüyor.
+
+Bunların her biri yeni bir araç demek, ve her araç her mesajda token harcıyor. O yüzden ancak
+gerçekten ihtiyaç olduğunda eklemeye değer.
 
 ## Sonuçlar
 
@@ -209,8 +254,8 @@ Gerekenler: Docker (macOS'ta OrbStack ile test edildi), Python 3 ve yerel sunucu
 portunda açık [LM Studio](https://lmstudio.ai).
 
 ```bash
-git clone https://github.com/enderkus/zabbix-mcp-local-llm.git
-cd zabbix-mcp-local-llm
+git clone https://github.com/enderkus/zabbix-mcp-lite.git
+cd zabbix-mcp-lite
 
 # 1. Yapılandırma: şifreleri doldur (openssl komutları dosyaların içinde)
 cp .env.example .env
@@ -311,7 +356,8 @@ Her araç çağrısını ve cevabı içeren ham sonuçlar [`bench/results/`](ben
   Zabbix agent*, *Windows by Zabbix agent*). Diğer template'lerde (SNMP, bulut) eşleştirme item
   adındaki sözcüklere dayanıyor. İngilizce adlarla çalışıyor ama daha az isabetli.
 - **Geçmiş veri son 7 günle sınırlı** ve ham history'den okunuyor (trend kullanılmıyor).
-- **4B'lik bir model yine de hata yapabilir.** Önemli değerleri Zabbix arayüzünde
+- **4B'lik bir model, araç doğru değeri döndürse bile hata yapabilir** (yukarıdaki bir cevapta
+  0.63 % değeri "%63" diye yazıldı). Önemli değerleri Zabbix arayüzünde
   (*Monitoring → Latest data*) kontrol et.
 - **zabbix-mcp-lite resmi bir Zabbix bileşeni değil.** Gelecekteki Zabbix API değişiklikleri
   için güncellenmesi gerekebilir.
