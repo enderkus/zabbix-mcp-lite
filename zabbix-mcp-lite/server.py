@@ -24,7 +24,7 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Annotated
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,8 @@ MAX_ITEMS = 10          # history_recent: item IDs per call
 MAX_CONCEPT_ITEMS = 4   # metric_history: e.g. several disks, or network in + out
 MAX_LATEST = 15         # latest_data: items per answer
 MAX_PROBLEMS = 20
+MAX_EVENTS = 1000        # problem_list with a period: events read
+MAX_PERIOD_DAYS = 31
 MAX_HOSTS_IN_ERRORS = 20
 NUMERIC = {"0", "3"}    # Zabbix value_type: 0 float, 3 unsigned
 TEXT = {"1", "2", "4"}  # 1 character, 2 log, 4 text
@@ -661,6 +663,162 @@ def _problem_list(host: str | None, auth: str) -> dict:
     return result
 
 
+# ------------------------------------------------------------------ past problems
+NIGHT = (20, 8)  # "last night" is 20:00 - 08:00
+_UNITS = (  # exact words, word prefixes, seconds
+    ({"m", "dk"}, ("min", "dakika"), 60),
+    ({"h", "sa", "hr"}, ("hour", "saat", "hrs"), 3600),
+    ({"d", "g"}, ("day", "gun"), 86400),
+    ({"w", "wk"}, ("week", "hafta"), 7 * 86400),
+)
+_NOW = {"now", "current", "currently", "active", "simdi", "aktif", "su an", "su anda"}
+
+
+def _unit(word: str, exact: bool = True) -> int | None:
+    for words, prefixes, seconds in _UNITS:
+        if (exact and word in words) or word.startswith(prefixes):
+            return seconds
+    return None
+
+
+def _period(text: str, now: datetime) -> tuple[datetime, datetime] | None:
+    """A time range from the user's words: "last night", "dün", "son 6 saat", "22:00", ...
+    None means "now" (the active problems)."""
+    raw = _fold(text).strip()
+    words = re.findall(r"[a-z]+", raw)
+    has = lambda *phrases: any(re.search(rf"\b{p}\b", raw) for p in phrases)  # noqa: E731
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday = today - timedelta(days=1)
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})(?:[ t]+(\d{1,2})[:.](\d{2}))?", raw)
+    if m:  # "2026-11-06", "2026-11-06 22:00"
+        y, mo, d, hh, mm = (int(x or 0) for x in m.groups())
+        return datetime(y, mo, d, hh, mm, tzinfo=now.tzinfo), now
+    m = re.search(r"(?<![\d.:])(\d{1,2})[:.](\d{2})(?![\d.:])", raw)
+    if m and int(m.group(1)) < 24 and int(m.group(2)) < 60:  # "22:00", "dün 22:00'den beri"
+        start = today.replace(hour=int(m.group(1)), minute=int(m.group(2)))
+        if start > now or (has("dun", "yesterday") and start.date() == today.date()):
+            start -= timedelta(days=1)
+        return start, now
+    m = re.search(r"(\d+)\s*([a-z]+)", raw)
+    if m and _unit(m.group(2)):  # "son 6 saat", "last 3 days", "24h"
+        return now - timedelta(seconds=int(m.group(1)) * _unit(m.group(2))), now
+    if has("hafta ?sonu", "weekend"):
+        saturday = today - timedelta(days=(today.weekday() - 5) % 7)
+        return saturday, min(saturday + timedelta(days=2), now)
+    monday = today - timedelta(days=today.weekday())
+    if has("gecen hafta", "last week", "previous week"):
+        return monday - timedelta(days=7), monday
+    if has("bu hafta", "this week"):
+        return monday, now
+    if has("gece", "night", "overnight", "tonight"):
+        if now.hour < NIGHT[1]:  # still the same night
+            return yesterday.replace(hour=NIGHT[0]), now
+        if now.hour >= NIGHT[0] and not has("dun", "yesterday", "last"):
+            return today.replace(hour=NIGHT[0]), now
+        return yesterday.replace(hour=NIGHT[0]), today.replace(hour=NIGHT[1])
+    if has("dun", "yesterday"):
+        return yesterday, today
+    if has("bugun", "today"):
+        return today, now
+    if has("sabah", "morning"):
+        day = today if now.hour >= 6 else yesterday
+        return day.replace(hour=6), min(day.replace(hour=12), now)
+    for word in words:  # "last hour", "son gün"
+        if len(word) >= 3 and _unit(word, exact=False):
+            return now - timedelta(seconds=_unit(word, exact=False)), now
+    if raw in _NOW or any(w in _NOW for w in words):
+        return None
+    raise ZabbixError(f"Could not read the period '{text}'. Use words such as 'last night', "
+                      "'yesterday', 'today', 'last 6 hours', '3 days' or a time like '22:00'.")
+
+
+def _problem_history(host: str | None, start: datetime, end: datetime, auth: str) -> dict:
+    """Problems that started in [start, end], resolved or not, grouped by host and name."""
+    oldest = datetime.now(start.tzinfo) - timedelta(days=MAX_PERIOD_DAYS)
+    start = max(start, oldest)
+    if end <= start:
+        raise ZabbixError("The period is empty or in the future.")
+    since, till = _fmt(int(start.timestamp())), _fmt(int(end.timestamp()))
+    params = {"source": 0, "object": 0, "value": 1, "time_from": int(start.timestamp()),
+              "time_till": int(end.timestamp()), "selectHosts": ["name"],
+              "output": ["eventid", "name", "severity", "clock", "r_eventid", "acknowledged"],
+              "sortfield": ["clock", "eventid"], "sortorder": "DESC", "limit": MAX_EVENTS}
+    scope = ""
+    if host and host.strip():
+        h = _resolve_host(host, auth)
+        params["hostids"] = [h["hostid"]]
+        scope = f" on {h['name']}"
+    try:
+        events = _api("event.get", params, auth)
+    except ZabbixError as e:
+        if "permission" not in str(e).lower():
+            raise
+        raise ZabbixError("Past problems need the event.get API method, which this token's "
+                          "Zabbix role does not allow. Without a period, problem_list still "
+                          "shows the active problems.") from e
+    recovery = [e["r_eventid"] for e in events if e["r_eventid"] != "0"]
+    ended = {}
+    if recovery:
+        ended = {r["eventid"]: int(r["clock"]) for r in _api(
+            "event.get", {"eventids": recovery, "output": ["eventid", "clock"]}, auth)}
+    # problems that began earlier and are still going on
+    before = {"source": 0, "object": 0, "time_till": params["time_from"], "output": ["eventid"]}
+    if "hostids" in params:
+        before["hostids"] = params["hostids"]
+    earlier = _api("problem.get", before, auth)
+    now = time.time()
+    groups: dict[tuple, dict] = {}
+    for e in sorted(events, key=lambda e: (int(e["clock"]), int(e["eventid"]))):
+        hosts = ", ".join(x["name"] for x in e.get("hosts", [])) or "?"
+        g = groups.setdefault((hosts, e["name"]), {"host": hosts, "problem": e["name"],
+                                                   "severity": 0, "times": 0, "longest": 0.0})
+        begin, finish = int(e["clock"]), ended.get(e["r_eventid"])
+        g["severity"] = max(g["severity"], int(e["severity"]))
+        g["times"] += 1
+        g.setdefault("first", begin)
+        g["last"], g["end"] = begin, finish
+        g["longest"] = max(g["longest"], (finish or now) - begin)
+    rows = []
+    for g in groups.values():
+        row = {"host": g["host"], "problem": g["problem"], "severity": SEVERITY[g["severity"]],
+               "started": _fmt(g["first"])}
+        if g["times"] == 1:
+            row["ended"] = _fmt(g["end"]) if g["end"] else "still active"
+            row["duration"] = _duration(g["longest"])
+        else:
+            row.update({"times": g["times"], "last_started": _fmt(g["last"]),
+                        "longest": _duration(g["longest"]),
+                        "now": "still active" if g["end"] is None else "resolved"})
+        rows.append((g, row))
+    if len(rows) > MAX_PROBLEMS:  # keep the most severe, then show them in time order
+        rows = sorted(rows, key=lambda r: (-r[0]["severity"], r[0]["first"]))[:MAX_PROBLEMS]
+    rows.sort(key=lambda r: r[0]["first"])
+    if not events:
+        summary = f"No problems started{scope} between {since} and {till}."
+    else:
+        active = sum(1 for g in groups.values() if g["end"] is None)
+        worst = max(groups.values(), key=lambda g: (g["severity"], g["longest"]))
+        hosts = {g["host"] for g in groups.values()}
+        summary = (f"{len(events)} problem event(s){scope} between {since} and {till}: "
+                   f"{len(groups)} different problem(s) on {len(hosts)} host(s), "
+                   f"{len(groups) - active} resolved, {active} still active. Most severe: "
+                   f"{SEVERITY[worst['severity']]} '{worst['problem']}' on {worst['host']} at "
+                   f"{_fmt(worst['first'])}"
+                   + (f", {worst['times']} times." if worst["times"] > 1 else
+                      f", lasted {_duration(worst['longest'])}." if worst["end"] else
+                      ", still active."))
+    if earlier:
+        summary += (f" {len(earlier)} problem(s) that started before this period are still "
+                    "active (problem_list without a period shows them).")
+    result = {"period": {"from": since, "till": till, "timezone": str(TZ)}, "summary": summary,
+              "problems": [row for _, row in rows]}
+    if len(groups) > MAX_PROBLEMS:
+        result["more"] = f"{len(groups) - MAX_PROBLEMS} more, less severe problems."
+    if len(events) == MAX_EVENTS:
+        result["note"] = f"Only the latest {MAX_EVENTS} events were read; use a shorter period."
+    return result
+
+
 # ------------------------------------------------------------------ MCP tools
 HostParam = Annotated[str | None, Field(
     description="Host name as shown by host_list, for example 'Zabbix server'. "
@@ -679,11 +837,24 @@ async def host_list(
 
 
 @mcp.tool()
-async def problem_list(host: HostParam = None, ctx: Context | None = None) -> dict:
-    """Active (unresolved) problems, most severe first, with host, severity, start time and
-    duration. Use for "are there any problems?" or "what is wrong on host X?".
-    Leave host empty to check all hosts."""
-    return await asyncio.to_thread(_problem_list, host, _auth(ctx))
+async def problem_list(
+    host: HostParam = None,
+    period: Annotated[str | None, Field(
+        description="Leave empty for the problems active now. For the past, the time in the "
+                    "user's own words, any language: 'last night', 'dün gece', 'yesterday', "
+                    "'today', 'son 6 saat', '3 days'.")] = None,
+    ctx: Context | None = None,
+) -> dict:
+    """Problems with host, severity, start time and duration. Without a period: the active
+    problems now, most severe first ("are there any problems?", "what is wrong on host X?").
+    With a period: what happened then, resolved or not, in time order ("what happened last
+    night?"). Leave host empty to check all hosts."""
+    auth = _auth(ctx)
+    if period and period.strip():
+        span = _period(period, datetime.now(TZ))
+        if span:
+            return await asyncio.to_thread(_problem_history, host, *span, auth)
+    return await asyncio.to_thread(_problem_list, host, auth)
 
 
 @mcp.tool()

@@ -43,13 +43,13 @@ ne kadar çok token döndürürse yolunu kaybetme ihtimali de o kadar artıyor.
 ## zabbix-mcp-lite
 
 Modelin yapamadığı işi kendisi yapan ve kısa, olduğu gibi aktarılabilecek cevaplar dönen tek bir
-MCP sunucusu ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py); ~750 satır Python, tek
+MCP sunucusu ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py); ~900 satır Python, tek
 bağımlılık):
 
 | Araç | Resmi sunucuda yerine geçtiği | Ne yapıyor |
 |---|---|---|
 | `host_list` | `host_get` | Host sayısı, adları, izleme durumu ve agent erişilebilirliği: host başına ~16.000 yerine ~200 karakter |
-| `problem_list` | `problem_get` + `trigger_get` | Aktif problemler; host, önem derecesi, başlangıç zamanı, süre ve "There are no active problems." gibi tek satırlık özetle |
+| `problem_list` | `problem_get` + `trigger_get` | Aktif problemler; host, önem derecesi, başlangıç zamanı, süre ve "There are no active problems." gibi tek satırlık özetle. Günlük dilde bir dönem verilirse ("dün gece", "son 6 saat") o sırada ne olduğu: çözülmüş ya da süren problemler, tekrarlar gruplanmış (resmi araçlarda olay geçmişi yok) |
 | `latest_data` | `item_get` | Günlük dilde söylenen bir metriğin birimli anlık değeri, host'un ana metriklerinin özeti ya da host verilmezse bir metriğin tüm host'larda karşılaştırması (en yüksekten başlayarak) |
 | `metric_history` | `item_get` + `history_get` | Son N dakikanın en düşük / ortalama / en yüksek / son değeri. Item'ı ve zaman aralığını kendisi buluyor |
 
@@ -90,7 +90,7 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
 
 - **Token saklamaz.** İstemcinin `Authorization: Bearer` başlığını Zabbix API'ye iletir;
   yetkileri o token'a göre Zabbix uygular. Sadece okuma metotlarını çağırır: `host.get`,
-  `item.get`, `history.get`, `problem.get` ve `trigger.get`.
+  `item.get`, `history.get`, `problem.get`, `trigger.get` ve `event.get`.
 - **Cevaplar birimli** (`0.55 %`, `6.42 GB`, `2.62 Kbps`, `3h 51m`), böylece model sayıyı
   yanlış yorumlamıyor.
 - **Cevaplar baştan küçük**, birkaç yüz karakter. Ayarlanması gereken bir cevap boyutu sınırı
@@ -110,13 +110,18 @@ host'un her item'ına günlük dildeki sözcüklerle ulaşıyor.
 | "Son 1 saatte CPU kullanımı?" "Son 24 saatte bellek?" | `metric_history` |
 | "Son 24 saatte en yüksek load average?" "Son 1 saatte ağ trafiği?" "Son 3 saatte swap?" | `metric_history` |
 | "Hangi hostta CPU kullanımı en yüksek?" "Disk doluluğu en yüksek olan host hangisi?" | `latest_data`, host vermeden: tek çağrıda tüm host'ları karşılaştırıp en yüksekten sıralıyor |
+| "Dün gece ne oldu?" "Son 6 saatte problem oldu mu?" | Dönem verilerek `problem_list`: zaman aralığını sunucu hesaplıyor |
 | Başka herhangi bir item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, item adındaki sözcüklerle eşleşerek |
 
 Bu listeyi yazmadan önce ilk altı satırdaki soruları (ve olmayan bir host hakkında bir soruyu)
 bu araçlarla Qwen3.5 4B'ye sordum. Host karşılaştırma satırı sonradan üç host'la test edildi
 (ikisinde agent var, birinde hiç item yok): 6 denemenin hepsinde tek bir `latest_data` çağrısı
 yapıldı ve cevap araç çıktısıyla tuttu (bir seferinde iki disk de %23,66 gösterdiği için
-"eşit" dedi). Son satır doğrudan araçlar üzerinde test edildi.
+"eşit" dedi). Geçmiş problemler satırı gerçek bir 6 dakikalık agent kesintisinden sonra test
+edildi: Türkçe ve İngilizce 10 denemenin hepsinde dönem kullanıcının sözcükleriyle verilerek
+tek bir `problem_list` çağrısı yapıldı ve doğru problemler listelendi (bir seferinde model bir
+problem adını çevirirken "100 item"ı "10" yaptı). Son satır doğrudan araçlar üzerinde test
+edildi.
 İlk turdaki 10 sorudan 8'i doğru cevaplandı, 2'si hatalıydı:
 
 - Bir cevapta CPU değeri 0.63 % yerine "%63" yazıldı. Aracın çıktısı doğruydu, tekrarlarda da
@@ -126,7 +131,7 @@ yapıldı ve cevap araç çıktısıyla tuttu (bir seferinde iki disk de %23,66 
   doğru cevaplandı.
 
 **Neden sadece dört araç?** Her aracın tanımı her mesajla birlikte modele gönderiliyor. Resmi
-sunucunun 12 aracı **3.618 token**, bu dört araç **1.050 token** tutuyor (Qwen3.5 4B
+sunucunun 12 aracı **3.618 token**, bu dört araç **1.162 token** tutuyor (Qwen3.5 4B
 tokenizer'ı). Bir dizüstü bilgisayarda bu, her mesajda saniyelerce fazladan işlem demek. Ayrıca
 küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabetli seçim yapıyor.
 
@@ -136,7 +141,8 @@ küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabe
   yapılandırmayı değiştiremez. Bilerek salt okunur.
 - **Yapılandırma sorularını cevaplamıyor:** trigger ifadeleri, template'ler, makrolar,
   kullanıcılar ya da host grupları gibi. `host_list` sadece ada göre filtreliyor.
-- **Sadece aktif problemleri gösteriyor**, çözülmüş problemlerin geçmişini değil.
+- **Geçmiş problemler en fazla 31 gün geriye gidiyor** ve başlangıç zamanına göre listeleniyor.
+  Dönemden önce başlayıp hâlâ süren bir problem özette sayılıyor ama listelenmiyor.
 - **Geçmiş veri son 7 günle sınırlı**, ham history'den okunuyor (trend ve grafik yok).
 - **Host karşılaştırması anlık değerlerle yapılıyor.** "Şu an CPU'su en yüksek host hangisi?"
   tek çağrı; "son 24 saatte CPU'su en yüksek host hangisiydi?" için hâlâ her host'a ayrı
@@ -225,6 +231,11 @@ gösteriyor; her soruya doğru cevap verileceğini değil.
 - Ham sonuçlar: [`20261106-160552.jsonl`](bench/results/20261106-160552.jsonl) (official,
   helper), [`20261106-202808.jsonl`](bench/results/20261106-202808.jsonl) (lite)
 - *helper* satırları sunucunun ilk sürümüyle ölçüldü (commit `e7b1fce`)
+- *lite* satırları birden fazla disk, host karşılaştırması ve geçmiş problemler eklenmeden önce
+  ölçüldü (araç tanımları o zaman 1.019 token, şimdi 1.162). Her değişiklikten sonra Qwen3.5 4B
+  ile yapılan kontroller 8/8 geçti. Geçmiş problemler eklendikten sonra model, 24 saatlik bellek
+  sorusunda `metric_history`'den önce `host_list` de çağırıyor (4 kontrol denemesinin 4'ünde);
+  bu yaklaşık 4 sn ekliyor.
 
 ¹ İlk test sırasında Mac bir kez uykuya geçti. Uyku sırasında çalışan kayıt (8.367 sn görünen
 bir süre aşımı) yeniden çalıştırıldı ve yine süre aşımına uğradı. Gemma'nın CPU hatası
@@ -239,7 +250,7 @@ Dokümandan anlaşılmayan ve zaman kaybettiren şeyler:
 
 1. **Zabbix 8.0'da varsayılan rollerde API erişimi kapalı.** Hazır *User role* ve *Admin role*
    `No permissions to call "host.get"` hatası veriyor. [`setup_zabbix.py`](setup_zabbix.py),
-   sadece MCP araçlarının kullandığı 12 okuma metoduna izin veren bir rol oluşturuyor.
+   sadece MCP araçlarının kullandığı 13 okuma metoduna izin veren bir rol oluşturuyor.
 2. **Zabbix 8.0'da `hostinterface.update` yok.** Arayüzler `host.update` ile, `interfaces`
    dizisi verilerek değiştiriliyor.
 3. **LibreChat, Bearer token kullanan MCP sunucusunu OAuth sanıyor.** Başlıksız ilk kontrolde
@@ -321,6 +332,9 @@ docker run -d --name zabbix-mcp-lite -p 127.0.0.1:8001:8000 \
   başlığıyla.
 - **Token'ın sahibi olan kullanıcının** yukarıdaki okuma metotlarına API erişimi olmalı.
   Minimal bir rol için [`setup_zabbix.py`](setup_zabbix.py)'ye bak.
+- **Önceki bir sürümden güncelliyorsan:** geçmiş problemler için `event.get` gerekiyor.
+  `python3 -I setup_zabbix.py`'yi tekrar çalıştır (rolü günceller ve yeni bir token üretir),
+  sonra `docker compose up -d`.
 - **`ALLOWED_HOSTS`**, sunucunun kabul ettiği `Host` başlıklarının listesi (DNS rebinding
   koruması). İstemcinin sunucuya eriştiği adı buraya ekle.
 
@@ -351,7 +365,7 @@ Her araç çağrısını ve cevabı içeren ham sonuçlar [`bench/results/`](ben
 ## Güvenlik notları
 
 - **Her şey salt okunur.** zabbix-mcp-lite sadece okuma metotlarını çağırıyor, resmi MCP
-  sunucusu sadece `*_get` araçlarını açıyor; token'ın sahibi olan kullanıcının rolü de sadece 12
+  sunucusu sadece `*_get` araçlarını açıyor; token'ın sahibi olan kullanıcının rolü de sadece 13
   okuma API metoduna izin veriyor.
 - **Portlar `127.0.0.1`'e bağlı.** MCP portları her zaman; web arayüzleri de `BIND_ADDR`
   değiştirilmedikçe.

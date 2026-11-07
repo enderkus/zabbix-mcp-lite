@@ -26,7 +26,7 @@ USERNAME = "mcp-reader"
 READ_METHODS = [
     "hostgroup.get", "templategroup.get", "host.get", "template.get", "item.get",
     "discoveryrule.get", "hostinterface.get", "usermacro.get", "problem.get",
-    "maintenance.get", "history.get", "trigger.get",
+    "maintenance.get", "history.get", "trigger.get", "event.get",
 ]
 TOKEN_NAME = "librechat-mcp"
 TOKEN_DAYS = 365

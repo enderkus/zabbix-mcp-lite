@@ -40,14 +40,14 @@ choose between 15 similar items, and the more tokens a tool returns, the more li
 
 ## zabbix-mcp-lite
 
-A single MCP server ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py), ~750 lines of
+A single MCP server ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py), ~900 lines of
 Python, one dependency) that does the work the model cannot do and returns short,
 ready-to-quote answers:
 
 | Tool | Replaces (official) | What it does |
 |---|---|---|
 | `host_list` | `host_get` | Count, names, monitoring status and agent availability: ~200 characters instead of ~16,000 per host |
-| `problem_list` | `problem_get` + `trigger_get` | Active problems with host, severity, start time and duration, plus a one-line summary such as "There are no active problems." |
+| `problem_list` | `problem_get` + `trigger_get` | Active problems with host, severity, start time and duration, plus a one-line summary such as "There are no active problems." With a period in plain words ("last night", "son 6 saat"), what happened then, resolved or not, repeats grouped (the official tools have no event history) |
 | `latest_data` | `item_get` | Current values with units for a metric in plain words, an overview of the main metrics of a host, or, without a host, one metric compared across all hosts (highest first) |
 | `metric_history` | `item_get` + `history_get` | Min / avg / max / last over the last N minutes. Finds the item and the time range itself |
 
@@ -88,7 +88,7 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
 
 - **Stores no token.** It forwards the client's `Authorization: Bearer` header to the Zabbix API,
   so Zabbix enforces that token's permissions. It only calls read methods: `host.get`,
-  `item.get`, `history.get`, `problem.get` and `trigger.get`.
+  `item.get`, `history.get`, `problem.get`, `trigger.get` and `event.get`.
 - **Answers carry units** (`0.55 %`, `6.42 GB`, `2.62 Kbps`, `3h 51m`), so the model does not
   reinterpret the numbers.
 - **Responses are small by design**, a few hundred characters, so there is no response size
@@ -108,13 +108,17 @@ host the token can read, by plain words.
 | "CPU usage over the last hour?" "Memory over the last 24 hours?" | `metric_history` |
 | "Highest load average in the last 24 hours?" "Network traffic in the last hour?" "Swap over the last 3 hours?" | `metric_history` |
 | "Which host has the highest CPU?" "Which host has the highest memory usage?" | `latest_data` without a host: one call compares every host, highest first |
+| "What happened last night?" "Any problems in the last 6 hours?" | `problem_list` with a period: the server works out the time range |
 | Any other item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, matched by the words in the item name |
 
 Before writing this list I asked the questions in the first six rows to Qwen3.5 4B with these
 tools, plus one about a host that does not exist. The host comparison row was tested later
 on three hosts (two with an agent, one without items): in 6 runs every answer used a single
 `latest_data` call and matched the tool output (once it called the disks a tie, both showed
-23.66 %). The last row was tested on the tools directly. The first round of 10 questions had 8 right answers and 2 failures:
+23.66 %). The past-problems row was tested after a real 6-minute agent outage: in 10 runs, in
+Turkish and English, every answer used one `problem_list` call with the period in the user's
+words and listed the right problems (once the model mistranslated a problem name, "100 items"
+became "10"). The last row was tested on the tools directly. The first round of 10 questions had 8 right answers and 2 failures:
 
 - One answer quoted the CPU value 0.63 % as "%63". The tool output was right, and reruns were
   correct.
@@ -123,7 +127,7 @@ on three hosts (two with an agent, one without items): in 6 runs every answer us
   3 of 3 times.
 
 **Why only four tools?** Every tool definition is sent to the model with every message. The
-official server's 12 tools take **3,618 tokens**; these four take **1,050** (Qwen3.5 4B
+official server's 12 tools take **3,618 tokens**; these four take **1,162** (Qwen3.5 4B
 tokenizer). On a laptop that is seconds of extra prompt processing per message, and a small model
 chooses better between 4 tools than between 12.
 
@@ -133,7 +137,8 @@ chooses better between 4 tools than between 12.
   the configuration. It is read-only on purpose.
 - **No configuration questions** such as trigger expressions, templates, macros, users or host
   groups. `host_list` filters by name only.
-- **Only active problems**, not the history of resolved ones.
+- **Past problems go back at most 31 days** and are listed by when they started. A problem
+  that began before the period and is still open is counted in the summary, not listed.
 - **History covers the last 7 days**, from raw history (no trends, no graphs).
 - **Host comparison uses current values.** "Which host has the highest CPU right now?" is one
   call; "which host had the highest CPU over the last 24 hours?" still needs a
@@ -220,6 +225,10 @@ every question will be answered correctly.
 - Raw results: [`20261106-160552.jsonl`](bench/results/20261106-160552.jsonl) (official,
   helper), [`20261106-202808.jsonl`](bench/results/20261106-202808.jsonl) (lite)
 - The *helper* rows were measured with the first version of the server (commit `e7b1fce`)
+- The *lite* rows were measured before the several-disks, host comparison and past-problems
+  additions (tool definitions then 1,019 tokens, now 1,162). Rechecks with Qwen3.5 4B after
+  each change passed 8/8. Since the past-problems change the model calls `host_list` before
+  `metric_history` on the 24-hour memory question (4 of 4 recheck runs), about 4 s more.
 
 ¹ The Mac went to sleep once during the first run. The record that ran while it slept (a timeout
 shown as 8,367 s) was rerun and timed out again. The Gemma CPU failure ran right after wake-up,
@@ -234,7 +243,7 @@ Things that cost time and are not obvious from the documentation:
 
 1. **Zabbix 8.0 default roles have API access disabled.** The built-in *User role* and *Admin
    role* return `No permissions to call "host.get"`. [`setup_zabbix.py`](setup_zabbix.py)
-   creates a role that allows only the 12 read methods behind the MCP tools.
+   creates a role that allows only the 13 read methods behind the MCP tools.
 2. **`hostinterface.update` no longer exists in Zabbix 8.0.** Interfaces are changed through
    `host.update` with an `interfaces` array.
 3. **LibreChat treats a Bearer-token MCP server as OAuth.** It probes without headers, gets
@@ -327,6 +336,9 @@ docker run -d --name zabbix-mcp-lite -p 127.0.0.1:8001:8000 \
   `Authorization: Bearer <Zabbix API token>`.
 - **The token's user needs API access** to the read methods listed above. See
   [`setup_zabbix.py`](setup_zabbix.py) for a minimal role.
+- **Upgrading from an earlier version:** past problems need `event.get`. Re-run
+  `python3 -I setup_zabbix.py` (it updates the role and issues a new token), then
+  `docker compose up -d`.
 - **`ALLOWED_HOSTS`** is the list of `Host` headers the server accepts (DNS rebinding
   protection). Add the name your client uses to reach it.
 
@@ -357,7 +369,7 @@ Raw results, including every tool call and answer, are in [`bench/results/`](ben
 ## Security notes
 
 - **Everything is read-only.** zabbix-mcp-lite only calls read methods, the official MCP server
-  exposes only `*_get` tools, and the token belongs to a user whose role allows only 12 read API
+  exposes only `*_get` tools, and the token belongs to a user whose role allows only 13 read API
   methods.
 - **Ports are bound to `127.0.0.1`.** The MCP ports always are; the web UIs are too, unless you
   set `BIND_ADDR`.
