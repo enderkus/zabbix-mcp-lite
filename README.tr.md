@@ -43,14 +43,14 @@ ne kadar çok token döndürürse yolunu kaybetme ihtimali de o kadar artıyor.
 ## zabbix-mcp-lite
 
 Modelin yapamadığı işi kendisi yapan ve kısa, olduğu gibi aktarılabilecek cevaplar dönen tek bir
-MCP sunucusu ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py); ~500 satır Python, tek
+MCP sunucusu ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py); ~750 satır Python, tek
 bağımlılık):
 
 | Araç | Resmi sunucuda yerine geçtiği | Ne yapıyor |
 |---|---|---|
 | `host_list` | `host_get` | Host sayısı, adları, izleme durumu ve agent erişilebilirliği: host başına ~16.000 yerine ~200 karakter |
 | `problem_list` | `problem_get` + `trigger_get` | Aktif problemler; host, önem derecesi, başlangıç zamanı, süre ve "There are no active problems." gibi tek satırlık özetle |
-| `latest_data` | `item_get` | Günlük dilde söylenen bir metriğin birimli anlık değeri ya da host'un ana metriklerinin özeti |
+| `latest_data` | `item_get` | Günlük dilde söylenen bir metriğin birimli anlık değeri, host'un ana metriklerinin özeti ya da host verilmezse bir metriğin tüm host'larda karşılaştırması (en yüksekten başlayarak) |
 | `metric_history` | `item_get` + `history_get` | Son N dakikanın en düşük / ortalama / en yüksek / son değeri. Item'ı ve zaman aralığını kendisi buluyor |
 
 Beşinci araç `history_recent`, aynı istatistiği item ID'leriyle döndürüyor (ileri kullanım için).
@@ -109,10 +109,14 @@ host'un her item'ına günlük dildeki sözcüklerle ulaşıyor.
 | "Ne kadar boş bellek var?" "Toplam ne kadar RAM var?" "Disk doluluğu ne kadar?" | `latest_data` / `metric_history` |
 | "Son 1 saatte CPU kullanımı?" "Son 24 saatte bellek?" | `metric_history` |
 | "Son 24 saatte en yüksek load average?" "Son 1 saatte ağ trafiği?" "Son 3 saatte swap?" | `metric_history` |
+| "Hangi hostta CPU kullanımı en yüksek?" "Disk doluluğu en yüksek olan host hangisi?" | `latest_data`, host vermeden: tek çağrıda tüm host'ları karşılaştırıp en yüksekten sıralıyor |
 | Başka herhangi bir item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, item adındaki sözcüklerle eşleşerek |
 
 Bu listeyi yazmadan önce ilk altı satırdaki soruları (ve olmayan bir host hakkında bir soruyu)
-bu araçlarla Qwen3.5 4B'ye sordum. Son satır doğrudan araçlar üzerinde test edildi.
+bu araçlarla Qwen3.5 4B'ye sordum. Host karşılaştırma satırı sonradan üç host'la test edildi
+(ikisinde agent var, birinde hiç item yok): 6 denemenin hepsinde tek bir `latest_data` çağrısı
+yapıldı ve cevap araç çıktısıyla tuttu (bir seferinde iki disk de %23,66 gösterdiği için
+"eşit" dedi). Son satır doğrudan araçlar üzerinde test edildi.
 İlk turdaki 10 sorudan 8'i doğru cevaplandı, 2'si hatalıydı:
 
 - Bir cevapta CPU değeri 0.63 % yerine "%63" yazıldı. Aracın çıktısı doğruydu, tekrarlarda da
@@ -122,7 +126,7 @@ bu araçlarla Qwen3.5 4B'ye sordum. Son satır doğrudan araçlar üzerinde test
   doğru cevaplandı.
 
 **Neden sadece dört araç?** Her aracın tanımı her mesajla birlikte modele gönderiliyor. Resmi
-sunucunun 12 aracı **3.618 token**, bu dört araç **1.023 token** tutuyor (Qwen3.5 4B
+sunucunun 12 aracı **3.618 token**, bu dört araç **1.050 token** tutuyor (Qwen3.5 4B
 tokenizer'ı). Bir dizüstü bilgisayarda bu, her mesajda saniyelerce fazladan işlem demek. Ayrıca
 küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabetli seçim yapıyor.
 
@@ -134,8 +138,9 @@ küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabe
   kullanıcılar ya da host grupları gibi. `host_list` sadece ada göre filtreliyor.
 - **Sadece aktif problemleri gösteriyor**, çözülmüş problemlerin geçmişini değil.
 - **Geçmiş veri son 7 günle sınırlı**, ham history'den okunuyor (trend ve grafik yok).
-- **Her çağrıda tek host.** "200 host'tan hangisinin CPU'su en yüksek?" sorusu her host için ayrı
-  çağrı gerektirir; küçük bir model bunu iyi yapamaz.
+- **Host karşılaştırması anlık değerlerle yapılıyor.** "Şu an CPU'su en yüksek host hangisi?"
+  tek çağrı; "son 24 saatte CPU'su en yüksek host hangisiydi?" için hâlâ her host'a ayrı
+  `metric_history` çağrısı gerekiyor.
 - **Metin ve log item'larında** sadece son beş değer dönüyor.
 
 Bunların her biri yeni bir araç demek, ve her araç her mesajda token harcıyor. O yüzden ancak

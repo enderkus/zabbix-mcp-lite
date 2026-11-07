@@ -40,7 +40,7 @@ choose between 15 similar items, and the more tokens a tool returns, the more li
 
 ## zabbix-mcp-lite
 
-A single MCP server ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py), ~500 lines of
+A single MCP server ([`zabbix-mcp-lite/server.py`](zabbix-mcp-lite/server.py), ~750 lines of
 Python, one dependency) that does the work the model cannot do and returns short,
 ready-to-quote answers:
 
@@ -48,7 +48,7 @@ ready-to-quote answers:
 |---|---|---|
 | `host_list` | `host_get` | Count, names, monitoring status and agent availability: ~200 characters instead of ~16,000 per host |
 | `problem_list` | `problem_get` + `trigger_get` | Active problems with host, severity, start time and duration, plus a one-line summary such as "There are no active problems." |
-| `latest_data` | `item_get` | Current values with units for a metric in plain words, or an overview of the main metrics of a host |
+| `latest_data` | `item_get` | Current values with units for a metric in plain words, an overview of the main metrics of a host, or, without a host, one metric compared across all hosts (highest first) |
 | `metric_history` | `item_get` + `history_get` | Min / avg / max / last over the last N minutes. Finds the item and the time range itself |
 
 A fifth tool, `history_recent`, returns the same statistics for explicit item IDs (advanced use).
@@ -107,10 +107,14 @@ host the token can read, by plain words.
 | "How much free memory is there?" "How much RAM in total?" "How full is the disk?" | `latest_data` / `metric_history` |
 | "CPU usage over the last hour?" "Memory over the last 24 hours?" | `metric_history` |
 | "Highest load average in the last 24 hours?" "Network traffic in the last hour?" "Swap over the last 3 hours?" | `metric_history` |
+| "Which host has the highest CPU?" "Which host has the highest memory usage?" | `latest_data` without a host: one call compares every host, highest first |
 | Any other item: "cpu iowait", "context switches", "interface errors", ... | `latest_data` / `metric_history`, matched by the words in the item name |
 
 Before writing this list I asked the questions in the first six rows to Qwen3.5 4B with these
-tools, plus one about a host that does not exist. The last row was tested on the tools directly. The first round of 10 questions had 8 right answers and 2 failures:
+tools, plus one about a host that does not exist. The host comparison row was tested later
+on three hosts (two with an agent, one without items): in 6 runs every answer used a single
+`latest_data` call and matched the tool output (once it called the disks a tie, both showed
+23.66 %). The last row was tested on the tools directly. The first round of 10 questions had 8 right answers and 2 failures:
 
 - One answer quoted the CPU value 0.63 % as "%63". The tool output was right, and reruns were
   correct.
@@ -119,7 +123,7 @@ tools, plus one about a host that does not exist. The last row was tested on the
   3 of 3 times.
 
 **Why only four tools?** Every tool definition is sent to the model with every message. The
-official server's 12 tools take **3,618 tokens**; these four take **1,023** (Qwen3.5 4B
+official server's 12 tools take **3,618 tokens**; these four take **1,050** (Qwen3.5 4B
 tokenizer). On a laptop that is seconds of extra prompt processing per message, and a small model
 chooses better between 4 tools than between 12.
 
@@ -131,8 +135,9 @@ chooses better between 4 tools than between 12.
   groups. `host_list` filters by name only.
 - **Only active problems**, not the history of resolved ones.
 - **History covers the last 7 days**, from raw history (no trends, no graphs).
-- **One host per call.** "Which of 200 hosts has the highest CPU?" needs a call per host, and a
-  small model will not do that well.
+- **Host comparison uses current values.** "Which host has the highest CPU right now?" is one
+  call; "which host had the highest CPU over the last 24 hours?" still needs a
+  `metric_history` call per host.
 - **Text and log items** return their last five values only.
 
 Each of these would be a new tool, and every tool costs tokens on every message, so they are

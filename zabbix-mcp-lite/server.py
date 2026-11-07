@@ -226,6 +226,9 @@ kullanim kullanimi kullanimini kullanma orani oran orani yuzde yuzdesi yuzdelik
 deger degeri degerleri nedir nasil ne kadar son su an anlik simdi ortalama ortalamasi
 en yuksek dusuk gecmis durum durumu saat saatlik gun gunluk dakika hafta
 hour hours day days minute minutes week
+which highest lowest top most least busiest hosts hangi hangisi hangisinde hangisinin fazla
+hostta hostda hostun hostunda hostlar hostlarda hostlardan hostlarin sunucuda sunucular
+sunucularda sunuculardan sunucularin
 """.split())
 
 # Plain-language metric names -> standard Zabbix template items. Most specific first.
@@ -393,6 +396,9 @@ def _match_items(items: list[dict], query: str, ignore: set[str]) -> tuple[str, 
         family = concept["family"]
         allowed = concept["primary"] | concept["companion"]
         leftover = [t for t in toks if not any(_word_match(t, w) for w in allowed)]
+        # a leftover word that is in no item name ("hostta cpu") does not make it more specific
+        leftover = [t for t in leftover
+                    if any(_token_hits(t, _tokens(_name(i) + " " + i["key_"])) for i in items)]
         if leftover:
             break  # more specific than the concept ("cpu iowait"): match words instead
         ranked = []
@@ -512,7 +518,84 @@ def _latest(item: dict) -> dict:
             "updated": _fmt(int(item["lastclock"])) if _has_data(item) else "never"}
 
 
+def _literal(pattern: str) -> str:
+    """The fixed start of a key regexp, for example "vfs.fs." for the disk keys."""
+    out, i = [], 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "\\" and i + 1 < len(pattern):
+            c, i = pattern[i + 1], i + 2
+        elif c in "()[]{}?*+|.^$":
+            break
+        else:
+            i += 1
+        if i < len(pattern) and pattern[i] in "?*{":  # optional character: stop before it
+            break
+        out.append(c)
+    return "".join(out)
+
+
+def _search_terms(query: str) -> list[str]:
+    """Key and name fragments for one item.get over all hosts; _match_items then picks."""
+    terms = {"vfs.fs."} if _MOUNT.search(query) else set()
+    for tok in _query_tokens(_MOUNT.sub(" ", query), set()):
+        if len(tok) >= 3:
+            terms.update((tok, *SYNONYMS.get(tok, ())))
+        for concept in CONCEPTS:
+            if any(_word_match(tok, w) for w in concept["primary"]):
+                terms.update(_literal(k) for k in concept["keys"])
+                terms.update(concept["names"])
+    return sorted(t for t in terms if len(t) >= 3)
+
+
+def _compare_hosts(search: str, hosts: list[dict], auth: str) -> dict:
+    """One metric on every monitored host, highest first ("which host has the most CPU?")."""
+    terms = _search_terms(search)
+    if not terms:
+        raise ZabbixError(f"'{search}' does not name a metric. Try cpu, memory, disk, load, "
+                          "network, swap or uptime.")
+    items = _api("item.get", {"hostids": [h["hostid"] for h in hosts], "monitored": True,
+                              "output": ITEM_FIELDS + ["hostid"], "searchByAny": True,
+                              "search": {"key_": terms, "name": terms}}, auth)
+    by_host: dict[str, list[dict]] = {}
+    for item in items:
+        by_host.setdefault(item["hostid"], []).append(item)
+    rows, missing = [], []
+    for h in hosts:
+        kind, matches = _match_items(by_host.get(h["hostid"], []), search, set())
+        numeric = [i for i in matches if i["value_type"] in NUMERIC and _has_data(i)]
+        if not numeric:
+            missing.append(h["name"])
+            continue
+        # several disks or interfaces on one host: its highest one counts
+        best = max(numeric, key=_number) if kind == "concept" else numeric[0]
+        rows.append((_number(best), {"host": h["name"], **_latest(best)}))
+    if not rows:
+        raise ZabbixError(f"No host has a numeric item with data matching '{search}'. "
+                          "Pass a host, or call latest_data with a host and a search word "
+                          "to see item names.")
+    rows.sort(key=lambda r: -r[0])
+    top, low = rows[0][1], rows[-1][1]
+    summary = f"Highest: {top['host']} ({top['name']} = {top['value']})"
+    if len(rows) > 1:
+        summary += f"; lowest: {low['host']} ({low['name']} = {low['value']})"
+    summary += f". {len(rows)} host(s) compared"
+    summary += f", {len(missing)} without this metric." if missing else "."
+    result = {"metric": search, "summary": summary,
+              "hosts": [row for _, row in rows[:MAX_LATEST]]}
+    if len(rows) > MAX_LATEST:
+        result["more"] = f"{len(rows) - MAX_LATEST} more hosts with lower values."
+    if missing:
+        result["without_this_metric"] = missing[:MAX_HOSTS_IN_ERRORS]
+    return result
+
+
 def _latest_data(host: str | None, search: str | None, auth: str) -> dict:
+    if not (host and host.strip()) and search and search.strip():
+        hosts = _api("host.get", {"output": ["hostid", "name"], "monitored_hosts": True,
+                                  "sortfield": "name"}, auth)
+        if len(hosts) > 1:  # no host but a metric: compare all hosts
+            return _compare_hosts(search, hosts, auth)
     h = _resolve_host(host, auth)
     items = _host_items(h["hostid"], auth)
     if search and search.strip():
@@ -613,7 +696,8 @@ async def latest_data(
     ctx: Context | None = None,
 ) -> dict:
     """Current (latest) values of a host's metrics, like Monitoring > Latest data in Zabbix.
-    Use for "what is the CPU usage now?" or "how is host X doing?"."""
+    Use for "what is the CPU usage now?" or "how is host X doing?". Leave host empty and give
+    a search to compare all hosts, highest first: "which host has the highest CPU?"."""
     return await asyncio.to_thread(_latest_data, host, search, _auth(ctx))
 
 
