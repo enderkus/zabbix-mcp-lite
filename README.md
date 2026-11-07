@@ -72,6 +72,11 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
   The same goes for *load*, *swap*, *uptime*, *processes* and *ping*.
 - **Turkish works too, including suffixes:** *işlemci*, *belleği*, *ağ trafiği*,
   *kullanılabilir bellek*.
+- **Several disks:** *disk* returns the used-% of every file system, `/` first and then the
+  fullest ones. `metric_history` returns up to 4 of them and names the rest in `other_matches`.
+  A mount in the question narrows it down: *disk /var*, *"/var'ın doluluğu"*, *disk C:*
+  (*/var free* → *FS [/var]: Space: Available*). If the host has no such mount, the error lists
+  the file systems it does have.
 - **More specific requests fall back to the words in item names and keys:** *cpu iowait* →
   *CPU iowait time*, *available memory* → *Available memory*.
 - **Hosts are matched loosely**, so "Zabbix server'ın" also works. With a single host, the host
@@ -114,7 +119,7 @@ tools, plus one about a host that does not exist. The last row was tested on the
   3 of 3 times.
 
 **Why only four tools?** Every tool definition is sent to the model with every message. The
-official server's 12 tools take **3,618 tokens**; these four take **1,019** (Qwen3.5 4B
+official server's 12 tools take **3,618 tokens**; these four take **1,023** (Qwen3.5 4B
 tokenizer). On a laptop that is seconds of extra prompt processing per message, and a small model
 chooses better between 4 tools than between 12.
 

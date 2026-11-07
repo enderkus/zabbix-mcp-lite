@@ -245,7 +245,8 @@ CONCEPTS = [
     {"primary": {"disk", "fs", "filesystem", "storage", "depolama", "dosya", "space", "alan"},
      "companion": {"doluluk", "dolu", "kullanilan", "alani"},
      "keys": [r"vfs\.fs\.(dependent\.)?size\[.*,pused\]"],
-     "names": ["space: used, in %", "used, in %"], "family": r"vfs\.(fs|dev)\..*"},
+     "names": ["space: used, in %", "used, in %"], "family": r"vfs\.(fs|dev)\..*",
+     "fullest_first": True},
     {"primary": {"network", "net", "ag", "trafik", "traffic", "bandwidth", "bant",
                  "interface", "arayuz"},
      "companion": {"genisligi", "in", "out", "gelen", "giden"},
@@ -337,9 +338,53 @@ def _concept_rank(item: dict, concept: dict) -> tuple | None:
     return None
 
 
+# A file system named in the question: "/", "/var/log", "C:" ("/var'ın doluluğu", "disk C:")
+_MOUNT = re.compile(r"(?<!\S)(/[^\s'’,;?!]*|[A-Za-z]:)(?:['’]\w*)?(?=[\s\\,;?!.]|$)")
+_FS_KEY = re.compile(r"vfs\.fs\.(?!get\b|discovery\b)[\w.]*\[\s*\"?([^,\"\]]*)")
+_DISK_WORDS = next(c["primary"] for c in CONCEPTS if "disk" in c["primary"])
+
+
+def _norm_mount(mount: str) -> str:
+    mount = mount.rstrip(".")
+    if re.fullmatch(r"[A-Za-z]:", mount):
+        return mount.upper()
+    return mount.rstrip("/") or "/"
+
+
+def _mount_of(item: dict) -> str | None:
+    m = _FS_KEY.match(item["key_"])
+    return _norm_mount(m.group(1)) if m and m.group(1) else None
+
+
+def _mounts(items: list[dict]) -> list[str]:
+    return sorted({m for m in map(_mount_of, items) if m})
+
+
+def _number(item: dict) -> float:
+    try:
+        return float(item.get("lastvalue") or 0)
+    except ValueError:
+        return 0.0
+
+
+def _mount_hint(items: list[dict], query: str) -> str:
+    if not _MOUNT.search(query):
+        return ""
+    mounts = _mounts(items)
+    if not mounts:
+        return "This host has no file system items. "
+    return f"File systems on this host: {', '.join(mounts[:MAX_HOSTS_IN_ERRORS])}. "
+
+
 def _match_items(items: list[dict], query: str, ignore: set[str]) -> tuple[str, list[dict]]:
     """Return ("concept" | "words", items best first) for a plain-language metric name."""
+    mounts = {_norm_mount(m) for m in _MOUNT.findall(query)}
+    if mounts:  # only that file system; "/var" alone means its disk usage
+        items = [i for i in items if _mount_of(i) in mounts]
+        query = _MOUNT.sub(" ", query)
     toks = _query_tokens(query, ignore)
+    if mounts and not any(_word_match(t, w) for t in toks for w in _DISK_WORDS):
+        toks = ["disk", *toks]
     family = None
     for concept in CONCEPTS:
         primary = [t for t in toks if any(_word_match(t, w) for w in concept["primary"])]
@@ -353,8 +398,10 @@ def _match_items(items: list[dict], query: str, ignore: set[str]) -> tuple[str, 
         ranked = []
         for item in items:
             rank = _concept_rank(item, concept)
-            if rank is not None:
-                ranked.append(((rank[0], not _has_data(item), rank[1], _name(item)), item))
+            if rank is not None:  # several disks: "/" first, then the fullest
+                fullest = -_number(item) if concept.get("fullest_first") else 0
+                ranked.append(((rank[0], not _has_data(item), rank[1], fullest, _name(item)),
+                               item))
         if ranked:
             ranked.sort(key=lambda r: r[0])
             best = ranked[0][0][0]
@@ -436,9 +483,9 @@ def _metric_history(host: str | None, metric: str, minutes: int, auth: str) -> d
     kind, matches = _match_items(items, metric, set(_tokens(h["host"] + " " + h["name"])))
     if not matches:
         raise ZabbixError(
-            f"No item on host '{h['name']}' matches '{metric}'. Try a plain word such as "
-            "cpu, memory, disk, load, network, swap or uptime, or call latest_data with a "
-            "search word to see item names.")
+            f"No item on host '{h['name']}' matches '{metric}'. " + _mount_hint(items, metric)
+            + "Try a plain word such as cpu, memory, disk, load, network, swap or uptime, or "
+            "call latest_data with a search word to see item names.")
     chosen = matches[:MAX_CONCEPT_ITEMS] if kind == "concept" else matches[:1]
     result = {"host": h["name"], **_history(chosen, minutes, auth)}
     others = [_name(i) for i in matches[len(chosen):len(chosen) + 5]]
@@ -471,8 +518,9 @@ def _latest_data(host: str | None, search: str | None, auth: str) -> dict:
     if search and search.strip():
         _, matches = _match_items(items, search, set(_tokens(h["host"] + " " + h["name"])))
         if not matches:
-            raise ZabbixError(f"No item on host '{h['name']}' matches '{search}'. Leave "
-                              "search empty for an overview of the main metrics.")
+            raise ZabbixError(f"No item on host '{h['name']}' matches '{search}'. "
+                              + _mount_hint(items, search) + "Leave search empty for an "
+                              "overview of the main metrics.")
     else:  # overview: the best item of each common metric
         matches, seen = [], set()
         for word in OVERVIEW:
@@ -560,7 +608,7 @@ async def latest_data(
     host: HostParam = None,
     search: Annotated[str | None, Field(
         description="The metric in the user's own words, any language, for example 'cpu', "
-                    "'free memory', 'disk', 'ağ trafiği', 'uptime'. Leave empty for an overview "
+                    "'free memory', 'disk', 'disk /var', 'ağ trafiği'. Leave empty for an overview "
                     "of the main metrics.")] = None,
     ctx: Context | None = None,
 ) -> dict:
@@ -573,7 +621,7 @@ async def latest_data(
 async def metric_history(
     metric: Annotated[str, Field(
         description="The metric in the user's own words, any language, for example 'cpu', "
-                    "'memory', 'free memory', 'disk', 'load', 'ağ trafiği'. The server finds "
+                    "'memory', 'free memory', 'disk', 'disk /var', 'ağ trafiği'. The server finds "
                     "the matching Zabbix item.")],
     host: HostParam = None,
     minutes: Annotated[int, Field(description="How many minutes back from now, 1-10080. "

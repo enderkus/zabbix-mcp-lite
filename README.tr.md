@@ -74,6 +74,11 @@ metric_history(host="Zabbix server", metric="cpu", minutes=60)
   *network* → gelen ve giden bit. *load*, *swap*, *uptime*, *processes* ve *ping* de böyle.
 - **Türkçe de çalışıyor, ekleriyle birlikte:** *işlemci*, *belleği*, *ağ trafiği*,
   *kullanılabilir bellek*.
+- **Birden fazla disk varsa:** *disk* her dosya sisteminin kullanım yüzdesini getiriyor; önce
+  `/`, sonra en dolu olanlar. `metric_history` bunlardan en fazla 4'ünü döndürüyor, kalanların
+  adını `other_matches` içinde veriyor. Soruda mount geçerse sadece o geliyor: *disk /var*,
+  *"/var'ın doluluğu"*, *disk C:* (*/var free* → *FS [/var]: Space: Available*). Host'ta öyle
+  bir mount yoksa hata mesajı mevcut dosya sistemlerini listeliyor.
 - **Daha özel istekler item adı ve anahtarındaki sözcüklerle eşleşiyor:** *cpu iowait* →
   *CPU iowait time*, *available memory* → *Available memory*.
 - **Host adı esnek eşleşiyor**, "Zabbix server'ın" da çalışıyor. Tek host varsa host hiç
@@ -117,7 +122,7 @@ bu araçlarla Qwen3.5 4B'ye sordum. Son satır doğrudan araçlar üzerinde test
   doğru cevaplandı.
 
 **Neden sadece dört araç?** Her aracın tanımı her mesajla birlikte modele gönderiliyor. Resmi
-sunucunun 12 aracı **3.618 token**, bu dört araç **1.019 token** tutuyor (Qwen3.5 4B
+sunucunun 12 aracı **3.618 token**, bu dört araç **1.023 token** tutuyor (Qwen3.5 4B
 tokenizer'ı). Bir dizüstü bilgisayarda bu, her mesajda saniyelerce fazladan işlem demek. Ayrıca
 küçük bir model 4 araç arasından 12 araç arasından olduğundan daha isabetli seçim yapıyor.
 
